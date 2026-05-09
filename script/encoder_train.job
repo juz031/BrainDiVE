@@ -1,0 +1,16 @@
+#!/bin/bash
+#SBATCH -N 1
+#SBATCH --job-name=brain_enc
+#SBATCH --time=10-00:00:00
+#SBATCH -p gpu
+#SBATCH --gres=gpu:1
+#SBATCH --nodelist=mind-0-28
+#SBATCH --mem=32G
+#SBATCH --cpus-per-gpu=8
+
+
+echo "SLURM_JOBID: " $SLURM_JOBID
+source activate env2025
+cd /home/junruz/BrainDiVE/
+
+python encoder_training_CNN.py
