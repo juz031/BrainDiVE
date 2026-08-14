@@ -1,0 +1,50 @@
+#!/bin/bash
+#SBATCH --output=/home/junruz/BrainDiVE/script/slurm_out/plot-ranked-images-%j.out
+#SBATCH --job-name=plot_prfdive
+#SBATCH --nodes=1
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-gpu=8
+#SBATCH --mem=32G
+#SBATCH --time=04:00:00
+
+set -eo pipefail
+
+echo "SLURM_JOBID: ${SLURM_JOBID}"
+echo "Running on node: ${SLURM_JOB_NODELIST}"
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+source activate env2025
+set -u
+cd /home/junruz/BrainDiVE
+
+INPUT_ROOT=${INPUT_ROOT:-/user_data/junruz/BrainDiVE/contrast_con/pRF_zscore_model_ranked/sub-01}
+OUTPUT_ROOT=${OUTPUT_ROOT:-/user_data/junruz/BrainDiVE_ranked_grids/sub-01}
+MODEL_ROOT=${MODEL_ROOT:-/user_data/junruz/prf_models/fixed/split_1_zscore}
+FEATURE_ROOT=${FEATURE_ROOT:-/user_data/junruz/prf_features}
+NSD_ROOT=${NSD_ROOT:-/lab_data/hendersonlab/datasets/nsd_preproc}
+NATURAL_IMAGES=${NATURAL_IMAGES:-5}
+DPI=${DPI:-200}
+GENERATION_MODEL=${GENERATION_MODEL:-OPEN_CLIP_RN50}
+
+GENERATION_MODEL_ARGS=()
+if [[ -n "${GENERATION_MODEL}" ]]; then
+    GENERATION_MODEL_ARGS=(--generation-model "${GENERATION_MODEL}")
+fi
+
+echo "Input: ${INPUT_ROOT}"
+echo "Output: ${OUTPUT_ROOT}"
+echo "Generation model: ${GENERATION_MODEL:-all}"
+echo "Natural images per voxel: ${NATURAL_IMAGES}"
+
+python -u plot_braindive_ranked_images.py \
+    --input "${INPUT_ROOT}" \
+    --output "${OUTPUT_ROOT}" \
+    --model-root "${MODEL_ROOT}" \
+    --feature-root "${FEATURE_ROOT}" \
+    --nsd-root "${NSD_ROOT}" \
+    "${GENERATION_MODEL_ARGS[@]}" \
+    --natural-images "${NATURAL_IMAGES}" \
+    --natural-only \
+    --fitting-device cuda \
+    --dpi "${DPI}"

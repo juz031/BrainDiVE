@@ -15,11 +15,14 @@ from diffusers.utils import (
     is_accelerate_available,
     is_accelerate_version,
     logging,
-    randn_tensor,
     replace_example_docstring,
 )
+from diffusers.utils.torch_utils import randn_tensor
 import numpy as np
-from diffusers.pipeline_utils import DiffusionPipeline
+try:
+    from diffusers.pipeline_utils import DiffusionPipeline
+except:
+    from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from diffusers import DiffusionPipeline, DPMSolverMultistepScheduler, StableDiffusionPipeline
@@ -29,6 +32,161 @@ from diffusers import LMSDiscreteScheduler, PNDMScheduler, DDIMScheduler, DPMSol
 from diffusers.models import AutoencoderKL, UNet2DConditionModel
 
 import random
+
+
+CONTRAST_CONSTRAINT_METHODS = ("none", "max", "range", "match")
+
+
+def _validate_contrast_constraint(
+    method,
+    min_contrast=None,
+    max_contrast=None,
+    target_contrast=None,
+):
+    if method not in CONTRAST_CONSTRAINT_METHODS:
+        raise ValueError(
+            f"contrast_constraint_method must be one of "
+            f"{CONTRAST_CONSTRAINT_METHODS}, got {method!r}."
+        )
+    if min_contrast is not None and not 0.0 <= min_contrast <= 0.5:
+        raise ValueError(
+            f"min_rms_contrast must be in [0, 0.5], got {min_contrast}."
+        )
+    if max_contrast is not None and not 0.0 < max_contrast <= 0.5:
+        raise ValueError(
+            f"max_rms_contrast must be in (0, 0.5], got {max_contrast}."
+        )
+    if (
+        min_contrast is not None
+        and max_contrast is not None
+        and min_contrast > max_contrast
+    ):
+        raise ValueError(
+            "min_rms_contrast cannot exceed max_rms_contrast, got "
+            f"{min_contrast} > {max_contrast}."
+        )
+    if target_contrast is not None and not 0.0 < target_contrast <= 0.5:
+        raise ValueError(
+            "target_rms_contrast must be in (0, 0.5], got "
+            f"{target_contrast}."
+        )
+    if method == "max" and max_contrast is None:
+        raise ValueError("The 'max' contrast method requires max_rms_contrast.")
+    if method == "range" and min_contrast is None and max_contrast is None:
+        raise ValueError(
+            "The 'range' contrast method requires min_rms_contrast and/or "
+            "max_rms_contrast."
+        )
+    if method == "match" and target_contrast is None:
+        raise ValueError(
+            "The 'match' contrast method requires target_rms_contrast."
+        )
+
+
+def apply_rms_contrast_constraint(
+    image_01,
+    method="none",
+    min_contrast=None,
+    max_contrast=None,
+    target_contrast=None,
+    eps=1e-8,
+    match_iterations=20,
+):
+    """Apply a per-image Rec.709 RMS contrast constraint.
+
+    ``max`` only reduces contrast above ``max_contrast``; ``range`` projects
+    contrast into the requested bounds; ``match`` projects it to the exact
+    ``target_contrast``; and ``none`` leaves the image unchanged.
+    """
+    _validate_contrast_constraint(
+        method,
+        min_contrast=min_contrast,
+        max_contrast=max_contrast,
+        target_contrast=target_contrast,
+    )
+    if method == "none":
+        return image_01
+    if match_iterations < 1:
+        raise ValueError("match_iterations must be at least 1.")
+    if image_01.ndim != 4 or image_01.shape[1] != 3:
+        raise ValueError(
+            "RMS contrast projection expects BCHW RGB input, "
+            f"got {tuple(image_01.shape)}."
+        )
+
+    weights = image_01.new_tensor((0.2126, 0.7152, 0.0722)).view(1, 3, 1, 1)
+    luminance = (image_01 * weights).sum(dim=1, keepdim=True)
+    luminance_mean = luminance.mean(dim=(-2, -1), keepdim=True)
+    contrast = torch.sqrt(
+        torch.mean(
+            (luminance - luminance_mean) ** 2,
+            dim=(-2, -1),
+            keepdim=True,
+        ).clamp_min(eps * eps)
+    )
+    if method == "match":
+        target = torch.as_tensor(
+            target_contrast, dtype=image_01.dtype, device=image_01.device
+        )
+    else:
+        target = contrast
+        if method == "range" and min_contrast is not None:
+            target = target.clamp_min(min_contrast)
+        if max_contrast is not None:
+            target = target.clamp_max(max_contrast)
+    scale = target / contrast.clamp_min(eps)
+    constrained = (image_01 - luminance_mean) * scale + luminance_mean
+
+    if method != "match":
+        return constrained.clamp(0, 1)
+
+    # Clipping can move RMS contrast away from the requested value. Repeating
+    # the affine projection compensates while keeping the operation
+    # differentiable for brain guidance.
+    for _ in range(match_iterations):
+        constrained = constrained.clamp(0, 1)
+        luminance = (constrained * weights).sum(dim=1, keepdim=True)
+        luminance_mean = luminance.mean(dim=(-2, -1), keepdim=True)
+        contrast = torch.sqrt(
+            torch.mean(
+                (luminance - luminance_mean) ** 2,
+                dim=(-2, -1),
+                keepdim=True,
+            ).clamp_min(eps * eps)
+        )
+        constrained = (
+            (constrained - luminance_mean)
+            * (target / contrast.clamp_min(eps))
+            + luminance_mean
+        )
+    return constrained.clamp(0, 1)
+
+
+def apply_rms_contrast_range(
+    image_01,
+    min_contrast=None,
+    max_contrast=None,
+    eps=1e-8,
+):
+    """Backward-compatible range projection wrapper."""
+    if min_contrast is None and max_contrast is None:
+        return image_01
+    return apply_rms_contrast_constraint(
+        image_01,
+        method="range",
+        min_contrast=min_contrast,
+        max_contrast=max_contrast,
+        eps=eps,
+    )
+
+
+def apply_rms_contrast_max(image_01, max_contrast, eps=1e-8):
+    """Backward-compatible wrapper that only caps RMS contrast."""
+    return apply_rms_contrast_range(
+        image_01,
+        max_contrast=max_contrast,
+        eps=eps,
+    )
 
 
 # def shuffle_shift(input_image, extent=2, seed=0):
@@ -380,7 +538,7 @@ class mypipelineSAG(DiffusionPipeline):
     def decode_latents(self, latents):
         latents = 1 / self.vae.config.scaling_factor * latents
         image = self.vae.decode(latents).sample
-        image = (image / 2 + 0.5).clamp(0, 1)
+        image = (image / 2 + 0.5).clamp(0, 1) # normalize to [0, 1] from [-1, 1]
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
         image = image.cpu().permute(0, 2, 3, 1).float().numpy()
         return image
@@ -458,7 +616,11 @@ class mypipelineSAG(DiffusionPipeline):
                 index,
                 text_embeddings,
                 noise_pred_original,
-                clip_guidance_scale):
+                clip_guidance_scale,
+                contrast_constraint_method,
+                min_rms_contrast,
+                max_rms_contrast,
+                target_rms_contrast):
         latents = latents.detach().requires_grad_()
         latent_model_input = self.scheduler.scale_model_input(latents, timestep)
 
@@ -491,31 +653,31 @@ class mypipelineSAG(DiffusionPipeline):
 
         sample = 1 / self.vae.config.scaling_factor * sample
         image = self.vae.decode(sample).sample
-        image = (image / 2 + 0.5).clamp(0, 1)
-        if not hasattr(self, "OPENAI_CLIP_MEAN"):
-            self.OPENAI_CLIP_MEAN = torch.from_numpy(
-                np.array((0.48145466, 0.4578275, 0.40821073), dtype=np.single)[None, :, None, None]).to(image.device)
-            self.OPENAI_CLIP_STD = torch.from_numpy(
-                np.array((0.26862954, 0.26130258, 0.27577711), dtype=np.single)[None, :, None, None]).to(image.device)
-            self.OPENAI_CLIP_MEAN.requires_grad = False
-            self.OPENAI_CLIP_STD.requires_grad = False
-        fp32_image = image.float()
-        resized_image = torch.nn.functional.interpolate(fp32_image, size=224, mode="bilinear")
-        normalized_image = (resized_image - self.OPENAI_CLIP_MEAN) / self.OPENAI_CLIP_STD
-        loss = self.brain_tweak(normalized_image) * clip_guidance_scale
+        image = (image / 2 + 0.5)#.clamp(0, 1)
+        model_image = apply_rms_contrast_constraint(
+            image.float(),
+            method=contrast_constraint_method,
+            min_contrast=min_rms_contrast,
+            max_contrast=max_rms_contrast,
+            target_contrast=target_rms_contrast,
+        )
+        loss = self.brain_tweak(model_image) * clip_guidance_scale
+        # print(f"The loss is {loss}")
         grads = -torch.autograd.grad(loss, latents)[0]
+        # print(f"The grads are {grads}")
         del loss
-        del normalized_image
-        del resized_image
-        del fp32_image
+        del model_image
         del image
 
         latents = latents.detach()
         if isinstance(self.scheduler, LMSDiscreteScheduler):
             latents = latents.detach() + grads * (sigma ** 2)
             noise_pred = noise_pred_original
+            # print('1111111111')
         else:
             noise_pred = noise_pred_original - torch.sqrt(beta_prod_t) * grads
+            # print(f'sqrt beta_prod_t: {torch.sqrt(beta_prod_t)}')
+            # print('2222222222')
             # noise_pred_mimic = noise_pred_original - torch.sqrt(beta_prod_t) * grads_small
             # noise_pred = clamp_latent(noise_pred, noise_pred_mimic, percentile=0.99)
 
@@ -553,6 +715,10 @@ class mypipelineSAG(DiffusionPipeline):
             guidance_scale: float = 7.5,
             sag_scale: float = 0.75,
             clip_guidance_scale=100.0,
+            contrast_constraint_method: Optional[str] = None,
+            min_rms_contrast: Optional[float] = None,
+            max_rms_contrast: Optional[float] = None,
+            target_rms_contrast: Optional[float] = None,
             negative_prompt: Optional[Union[str, List[str]]] = None,
             num_images_per_prompt: Optional[int] = 1,
             eta: float = 0.0,
@@ -646,6 +812,23 @@ class mypipelineSAG(DiffusionPipeline):
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
             prompt, height, width, callback_steps, negative_prompt, prompt_embeds, negative_prompt_embeds
+        )
+        # Preserve the pre-selector API: callers that only pass max/min bounds
+        # still get the corresponding constraint without choosing a method.
+        if contrast_constraint_method is None:
+            if target_rms_contrast is not None:
+                contrast_constraint_method = "match"
+            elif min_rms_contrast is not None:
+                contrast_constraint_method = "range"
+            elif max_rms_contrast is not None:
+                contrast_constraint_method = "max"
+            else:
+                contrast_constraint_method = "none"
+        _validate_contrast_constraint(
+            contrast_constraint_method,
+            min_contrast=min_rms_contrast,
+            max_contrast=max_rms_contrast,
+            target_contrast=target_rms_contrast,
         )
         self.grad_diff = 0.0
 
@@ -776,7 +959,11 @@ class mypipelineSAG(DiffusionPipeline):
                     i,
                     text_embeddings_for_guidance,
                     noise_pred,
-                    clip_guidance_scale
+                    clip_guidance_scale,
+                    contrast_constraint_method,
+                    min_rms_contrast,
+                    max_rms_contrast,
+                    target_rms_contrast,
                 )
             # compute the previous noisy sample x_t -> x_t-1
             latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
@@ -784,6 +971,7 @@ class mypipelineSAG(DiffusionPipeline):
             # old_latents_uncond = latents[0]+0.0
             # latents = clamp_latent(latents)
             # latents[0] = old_latents_uncond
+            # print(latents)
 
             # call the callback, if provided
             if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
@@ -792,7 +980,18 @@ class mypipelineSAG(DiffusionPipeline):
                     callback(i, t, latents)
 
         # 8. Post-processing
+        # print(latents)
         image = self.decode_latents(latents)
+        if contrast_constraint_method != "none":
+            image_tensor = torch.from_numpy(image).permute(0, 3, 1, 2)
+            image_tensor = apply_rms_contrast_constraint(
+                image_tensor,
+                method=contrast_constraint_method,
+                min_contrast=min_rms_contrast,
+                max_contrast=max_rms_contrast,
+                target_contrast=target_rms_contrast,
+            )
+            image = image_tensor.permute(0, 2, 3, 1).numpy()
 
         # 9. Run safety checker
         image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
@@ -828,7 +1027,7 @@ class mypipelineSAG(DiffusionPipeline):
         degraded_latents = degraded_latents * attn_mask + original_latents * (1 - attn_mask)
 
         # Noise it again to match the noise level
-        degraded_latents = self.scheduler.add_noise(degraded_latents, noise=eps, timesteps=t)
+        degraded_latents = self.scheduler.add_noise(degraded_latents, noise=eps, timesteps=torch.tensor([t]))
 
         return degraded_latents
 

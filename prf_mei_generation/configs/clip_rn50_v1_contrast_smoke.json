@@ -1,0 +1,31 @@
+{
+  "source_repo": "/home/hanfeig/MEI",
+  "model_name": "CLIP_RN50",
+  "layer_name": "layer2",
+  "model_dir": "/user_data/hanfeig/prf_models/fixed/split_1_zscore/S1/CLIP_RN50_set1/layer2",
+  "voxel_indices": [
+    9656
+  ],
+  "save_dir": "/user_data/hanfeig/prf_max_activation/smoke_tests/prf_mei_generation/clip_rn50_v1_rms16",
+  "device": "cuda",
+  "steps": 2,
+  "lr": 0.05,
+  "optimizer": "adam",
+  "num_restarts": 1,
+  "seed": 0,
+  "image_size": 224,
+  "init_mode": "random",
+  "tv_weight": 0.0001,
+  "l2_weight": 0.00001,
+  "jitter": 0,
+  "record_every": 1,
+  "contrast_units": "byte",
+  "train_contrast": 16.0,
+  "train_contrast_mode": "max",
+  "post_step_contrast": 16.0,
+  "post_step_contrast_mode": "max",
+  "final_contrast": 16.0,
+  "final_contrast_mode": "match",
+  "final_contrast_mean": 111.0
+}
+

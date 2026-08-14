@@ -1,0 +1,44 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments and local configuration
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Training artifacts and generated outputs
+weights/
+checkpoints/
+results/
+outputs/
+wandb/
+figure/
+MEI_generated/
+hanfei_code/
+
+# Cluster job logs
+script/slurm_out/
+slurm-*.out
+slurm-*.err

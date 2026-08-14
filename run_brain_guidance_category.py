@@ -18,10 +18,15 @@ import encoder_model_vit
 import nibabel as nib
 import os
 import time
+import clip
+
+from encoder_training import soft_quantizer_v3
+
 
 def load_from_nii(nii_file):
     return nib.load(nii_file).get_fdata()
 
+### BRAIN ENCODER ############################################################
 print("Creating CLIP ViT")
 # backbone = timm.create_model('vit_base_patch16_clip_224.laion2b', pretrained=True)
 backbone = model_vit.feature_extractor_vit()
@@ -118,11 +123,13 @@ for subject in all_subjects:
 
     other_args = myarg()
     dataset = neural_loader(other_args)
-    brain_model = model_vit.downproject_CLIP_split_linear(num_early_output=dataset.early_sizes, num_higher_output=dataset.higher_sizes)
-    weights = torch.load("/ocean/projects/soc220007p/aluo/DiffusionInception/results/subject_{}_neurips_split_VIT_last_fully_linear/00100.chkpt".format(subject))
-    brain_model.load_state_dict(weights["network"], strict=True)
-    brain_model.cuda()
-    brain_model.eval()
+    # brain_model = model_vit.downproject_CLIP_split_linear(num_early_output=dataset.early_sizes, num_higher_output=dataset.higher_sizes)
+    # weights = torch.load("/ocean/projects/soc220007p/aluo/DiffusionInception/results/subject_{}_neurips_split_VIT_last_fully_linear/00100.chkpt".format(subject))
+    # brain_model.load_state_dict(weights["network"], strict=True)
+    # brain_model.cuda()
+    # brain_model.eval()
+
+
     for name, param in brain_model.named_parameters():
         param.requires_grad = False
     assert not brain_model.training

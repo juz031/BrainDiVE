@@ -1,0 +1,120 @@
+#!/bin/bash
+#SBATCH --output=/home/junruz/BrainDiVE/script/slurm_out/slurm-%A_%a.out
+#SBATCH -N 1
+#SBATCH --job-name=prf_dive
+#SBATCH --time=10-00:00:00
+#SBATCH -p gpu
+#SBATCH --gres=gpu:1
+#SBATCH --nodelist=mind-1-19
+#SBATCH --mem=32G
+#SBATCH --cpus-per-gpu=8
+#SBATCH --array=0-1%2
+
+set -eo pipefail
+
+echo "SLURM_JOBID: ${SLURM_JOBID}"
+echo "SLURM_ARRAY_TASK_ID: ${SLURM_ARRAY_TASK_ID}"
+echo "Running on node: ${SLURM_JOB_NODELIST}"
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+source activate env2025
+set -u
+cd /home/junruz/BrainDiVE
+
+# Keep these arrays the same length. Each array task selects one column.
+GEN_MODELS=(
+    OPEN_CLIP_RN50
+    OPEN_CLIP_RN50
+)
+GEN_LAYERS=(
+    layer3
+    layer3
+)
+RANK_MODELS=(
+    ADV_RN50
+    DINO_RN50
+)
+RANK_LAYERS=(
+    layer3
+    layer3
+)
+
+TASK_ID=${SLURM_ARRAY_TASK_ID}
+if (( TASK_ID >= ${#GEN_MODELS[@]} ||
+      TASK_ID >= ${#GEN_LAYERS[@]} ||
+      TASK_ID >= ${#RANK_MODELS[@]} ||
+      TASK_ID >= ${#RANK_LAYERS[@]} )); then
+    echo "Array task ${TASK_ID} has no matching model/layer configuration" >&2
+    exit 1
+fi
+
+GEN_MODEL=${GEN_MODELS[$TASK_ID]}
+GEN_LAYER=${GEN_LAYERS[$TASK_ID]}
+RANK_MODEL=${RANK_MODELS[$TASK_ID]}
+RANK_LAYER=${RANK_LAYERS[$TASK_ID]}
+CONTRAST_STATS_JSON=/user_data/junruz/prf_models/fixed/split_1_zscore/S1/nsd_contrast_statistics.json
+
+# Contrast configuration. These values can be overridden with sbatch --export.
+# Methods: none, max, range, match.
+CONTRAST_METHOD=${CONTRAST_METHOD:-match}
+TARGET_RMS_CONTRAST=${TARGET_RMS_CONTRAST:-57.48}
+MAX_RMS_CONTRAST=${MAX_RMS_CONTRAST:-16}
+MIN_CONTRAST_PERCENTILE=${MIN_CONTRAST_PERCENTILE:-5}
+MAX_CONTRAST_PERCENTILE=${MAX_CONTRAST_PERCENTILE:-95}
+
+case "${CONTRAST_METHOD}" in
+    none)
+        CONTRAST_ARGS=(
+            --contrast_constraint_method none
+        )
+        ;;
+    max)
+        CONTRAST_ARGS=(
+            --contrast_constraint_method max
+            --max_rms_contrast "${MAX_RMS_CONTRAST}"
+        )
+        ;;
+    range)
+        CONTRAST_ARGS=(
+            --contrast_constraint_method range
+            --contrast_stats_json "${CONTRAST_STATS_JSON}"
+            --min_contrast_percentile "${MIN_CONTRAST_PERCENTILE}"
+            --max_contrast_percentile "${MAX_CONTRAST_PERCENTILE}"
+        )
+        ;;
+    match)
+        CONTRAST_ARGS=(
+            --contrast_constraint_method match
+            --target_rms_contrast "${TARGET_RMS_CONTRAST}"
+        )
+        ;;
+    *)
+        echo "Unsupported CONTRAST_METHOD: ${CONTRAST_METHOD}" >&2
+        exit 1
+        ;;
+esac
+
+echo "Generation model/layer: ${GEN_MODEL}/${GEN_LAYER}"
+echo "Ranking model/layer: ${RANK_MODEL}/${RANK_LAYER}"
+echo "Contrast method: ${CONTRAST_METHOD}"
+printf 'Contrast arguments:'
+printf ' %q' "${CONTRAST_ARGS[@]}"
+printf '\n'
+
+python -u run_image_generation_pRF_model_ranking.py \
+    --subject_id 1 \
+    --gen_model "${GEN_MODEL}" \
+    --rank_model "${RANK_MODEL}" \
+    --gen_layer_name "${GEN_LAYER}" \
+    --rank_layer_name "${RANK_LAYER}" \
+    --split_id 1 \
+    --feature_root /user_data/junruz/prf_features \
+    --model_root /user_data/junruz/prf_models/fixed/split_1_zscore \
+    "${CONTRAST_ARGS[@]}" \
+    --num_steps 200 \
+    --roi hV4 \
+    --brain_guidance_scale 1000 \
+    --num_seeds 1000 \
+    --ranking_top_n 10 \
+    --k 5 \
+    --save_root /user_data/junruz/BrainDiVE/contrast_con_fixed/pRF_zscore_model_ranked

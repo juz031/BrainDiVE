@@ -1,0 +1,86 @@
+#!/bin/bash
+#SBATCH --output=/home/junruz/BrainDiVE/script/slurm_out/validation-%A_%a.out
+#SBATCH -N 1
+#SBATCH --job-name=prf_validate
+#SBATCH --time=04:00:00
+#SBATCH -p gpu
+#SBATCH --gres=gpu:1
+# Compatible pool: RTX 3090, A5000, Titan RTX, and L40S.
+# Exclude 2080 Ti/Titan XP nodes and the newer RTX Pro node.
+#SBATCH --exclude=mind-0-18,mind-0-20,mind-0-22,mind-0-24,mind-1-11,mind-1-19
+#SBATCH --mem=32G
+#SBATCH --cpus-per-gpu=8
+#SBATCH --array=0-4%5
+
+set -eo pipefail
+
+echo "SLURM_JOBID: ${SLURM_JOBID}"
+echo "SLURM_ARRAY_TASK_ID: ${SLURM_ARRAY_TASK_ID}"
+echo "Running on node: ${SLURM_JOB_NODELIST}"
+if ! nvidia-smi --query-gpu=name,memory.total --format=csv; then
+    echo "ERROR: Slurm allocated a GPU that is not accessible on ${SLURM_JOB_NODELIST}." >&2
+    echo "Cancel this job and ask the cluster administrator to drain or repair the node." >&2
+    exit 1
+fi
+
+source activate env2025
+set -u
+cd /home/junruz/BrainDiVE
+
+if ! python -c 'import torch; assert torch.cuda.is_available(); print("Torch CUDA device:", torch.cuda.get_device_name(0))'; then
+    echo "ERROR: env2025 cannot access the Slurm-allocated CUDA device." >&2
+    exit 1
+fi
+
+VALIDATION_MODEL=${VALIDATION_MODEL:-OPEN_CLIP_CONVNEXT_BASE}
+VALIDATION_LAYER=${VALIDATION_LAYER:-}
+VALIDATION_SET=${VALIDATION_SET:-2}
+OUTPUT_ROOT=${OUTPUT_ROOT:-/user_data/junruz/BrainDiVE/validation}
+
+# Only include model/ROI combinations that currently have generated runs.
+MODEL_NAMES=(
+    OPEN_CLIP_RN50
+    OPEN_CLIP_RN50
+    DINO_RN50
+    ADV_RN50
+    ADV_RN50
+)
+ROIS=(
+    V1
+    hV4
+    hV4
+    V1
+    hV4
+)
+
+TASK_ID=${SLURM_ARRAY_TASK_ID}
+if (( TASK_ID < 0 || TASK_ID >= ${#MODEL_NAMES[@]} )); then
+    echo "ERROR: Array task ${TASK_ID} has no model/ROI configuration." >&2
+    exit 1
+fi
+MODEL_NAME=${MODEL_NAMES[$TASK_ID]}
+ROI=${ROIS[$TASK_ID]}
+
+VALIDATION_LAYER_ARGS=()
+if [[ -n "${VALIDATION_LAYER}" ]]; then
+    VALIDATION_LAYER_ARGS=(--validation-layer "${VALIDATION_LAYER}")
+fi
+
+echo "Generation model: ${MODEL_NAME}"
+echo "ROI: ${ROI}"
+echo "Validation model: ${VALIDATION_MODEL}"
+echo "Validation layer: ${VALIDATION_LAYER:-automatic}"
+echo "Validation encoding fit set: ${VALIDATION_SET}"
+echo "Output root: ${OUTPUT_ROOT}"
+
+python -u validation/heldout_model.py \
+    --model-name "${MODEL_NAME}" \
+    --roi "${ROI}" \
+    --model-root /user_data/junruz/prf_models/fixed/split_1_zscore \
+    --output-root "${OUTPUT_ROOT}" \
+    --validation-model "${VALIDATION_MODEL}" \
+    --validation-set "${VALIDATION_SET}" \
+    "${VALIDATION_LAYER_ARGS[@]}" \
+    --device cuda \
+    --batch-size 8 \
+    --overwrite
