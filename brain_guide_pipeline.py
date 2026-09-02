@@ -33,8 +33,18 @@ from diffusers.models import AutoencoderKL, UNet2DConditionModel
 
 import random
 
+from dual_scope_contrast_utils import (
+    match_global_and_prf_rms_contrast_final,
+    match_global_and_prf_rms_contrast_torch,
+    require_finite_seed_image,
+    require_converged,
+    result_to_jsonable,
+)
+
 
 CONTRAST_CONSTRAINT_METHODS = ("none", "max", "range", "match")
+CONTRAST_CONSTRAINT_TIMINGS = ("every_step", "final")
+CONTRAST_CONSTRAINT_SCOPES = ("full_image", "full_image_and_prf")
 
 
 def _validate_contrast_constraint(
@@ -81,6 +91,32 @@ def _validate_contrast_constraint(
         raise ValueError(
             "The 'match' contrast method requires target_rms_contrast."
         )
+
+
+def _validate_contrast_constraint_timing(timing):
+    if timing not in CONTRAST_CONSTRAINT_TIMINGS:
+        raise ValueError(
+            "contrast_constraint_timing must be one of "
+            f"{CONTRAST_CONSTRAINT_TIMINGS}, got {timing!r}."
+        )
+
+
+def _validate_contrast_constraint_scope(scope, method, spatial_weight):
+    if scope not in CONTRAST_CONSTRAINT_SCOPES:
+        raise ValueError(
+            "contrast_constraint_scope must be one of "
+            f"{CONTRAST_CONSTRAINT_SCOPES}, got {scope!r}."
+        )
+    if scope == "full_image_and_prf":
+        if method != "match":
+            raise ValueError(
+                "The 'full_image_and_prf' scope requires the 'match' "
+                "contrast method."
+            )
+        if spatial_weight is None:
+            raise ValueError(
+                "The 'full_image_and_prf' scope requires contrast_prf_weight."
+            )
 
 
 def apply_rms_contrast_constraint(
@@ -160,6 +196,57 @@ def apply_rms_contrast_constraint(
             + luminance_mean
         )
     return constrained.clamp(0, 1)
+
+
+def prepare_brain_guidance_image(
+    image_01,
+    *,
+    contrast_constraint_method,
+    contrast_constraint_timing,
+    contrast_constraint_scope="full_image",
+    contrast_prf_weight=None,
+    min_rms_contrast=None,
+    max_rms_contrast=None,
+    target_rms_contrast=None,
+    dual_scope_tolerance=0.01 / 255.0,
+    dual_scope_every_step_iterations=10,
+    dual_scope_parameter_limit=8.0,
+    dual_scope_envelope_power=0.5,
+):
+    """Return the image that the brain objective should evaluate."""
+    require_finite_seed_image(image_01, stage="brain-guidance decode")
+    _validate_contrast_constraint_timing(contrast_constraint_timing)
+    _validate_contrast_constraint_scope(
+        contrast_constraint_scope,
+        contrast_constraint_method,
+        contrast_prf_weight,
+    )
+    if contrast_constraint_timing == "final":
+        return image_01
+    if contrast_constraint_scope == "full_image_and_prf":
+        result = match_global_and_prf_rms_contrast_torch(
+            image_01,
+            contrast_prf_weight,
+            target_rms_contrast,
+            iterations=dual_scope_every_step_iterations,
+            tolerance=dual_scope_tolerance,
+            parameter_limit=dual_scope_parameter_limit,
+            adjustment_envelope_power=dual_scope_envelope_power,
+        )
+        require_converged(result, stage="every_step")
+        constrained = result.images
+    else:
+        constrained = apply_rms_contrast_constraint(
+            image_01,
+            method=contrast_constraint_method,
+            min_contrast=min_rms_contrast,
+            max_contrast=max_rms_contrast,
+            target_contrast=target_rms_contrast,
+        )
+    require_finite_seed_image(
+        constrained, stage="brain-guidance contrast projection"
+    )
+    return constrained
 
 
 def apply_rms_contrast_range(
@@ -618,9 +705,16 @@ class mypipelineSAG(DiffusionPipeline):
                 noise_pred_original,
                 clip_guidance_scale,
                 contrast_constraint_method,
+                contrast_constraint_timing,
+                contrast_constraint_scope,
+                contrast_prf_weight,
                 min_rms_contrast,
                 max_rms_contrast,
-                target_rms_contrast):
+                target_rms_contrast,
+                dual_scope_tolerance,
+                dual_scope_every_step_iterations,
+                dual_scope_parameter_limit,
+                dual_scope_envelope_power):
         latents = latents.detach().requires_grad_()
         latent_model_input = self.scheduler.scale_model_input(latents, timestep)
 
@@ -654,12 +748,19 @@ class mypipelineSAG(DiffusionPipeline):
         sample = 1 / self.vae.config.scaling_factor * sample
         image = self.vae.decode(sample).sample
         image = (image / 2 + 0.5)#.clamp(0, 1)
-        model_image = apply_rms_contrast_constraint(
+        model_image = prepare_brain_guidance_image(
             image.float(),
-            method=contrast_constraint_method,
-            min_contrast=min_rms_contrast,
-            max_contrast=max_rms_contrast,
-            target_contrast=target_rms_contrast,
+            contrast_constraint_method=contrast_constraint_method,
+            contrast_constraint_timing=contrast_constraint_timing,
+            contrast_constraint_scope=contrast_constraint_scope,
+            contrast_prf_weight=contrast_prf_weight,
+            min_rms_contrast=min_rms_contrast,
+            max_rms_contrast=max_rms_contrast,
+            target_rms_contrast=target_rms_contrast,
+            dual_scope_tolerance=dual_scope_tolerance,
+            dual_scope_every_step_iterations=dual_scope_every_step_iterations,
+            dual_scope_parameter_limit=dual_scope_parameter_limit,
+            dual_scope_envelope_power=dual_scope_envelope_power,
         )
         loss = self.brain_tweak(model_image) * clip_guidance_scale
         # print(f"The loss is {loss}")
@@ -716,9 +817,17 @@ class mypipelineSAG(DiffusionPipeline):
             sag_scale: float = 0.75,
             clip_guidance_scale=100.0,
             contrast_constraint_method: Optional[str] = None,
+            contrast_constraint_timing: str = "every_step",
+            contrast_constraint_scope: str = "full_image",
+            contrast_prf_weight: Optional[torch.Tensor] = None,
             min_rms_contrast: Optional[float] = None,
             max_rms_contrast: Optional[float] = None,
             target_rms_contrast: Optional[float] = None,
+            dual_scope_tolerance: float = 0.01 / 255.0,
+            dual_scope_solver_max_nfev: int = 300,
+            dual_scope_every_step_iterations: int = 10,
+            dual_scope_parameter_limit: float = 8.0,
+            dual_scope_envelope_power: float = 0.5,
             negative_prompt: Optional[Union[str, List[str]]] = None,
             num_images_per_prompt: Optional[int] = 1,
             eta: float = 0.0,
@@ -756,6 +865,13 @@ class mypipelineSAG(DiffusionPipeline):
                 SAG scale as defined in [Improving Sample Quality of Diffusion Models Using Self-Attention Guidance]
                 (https://arxiv.org/abs/2210.00939). `sag_scale` is defined as `s_s` of equation (24) of SAG paper:
                 https://arxiv.org/pdf/2210.00939.pdf. Typically chosen between [0, 1.0] for better quality.
+            contrast_constraint_timing (`str`, *optional*, defaults to `"every_step"`):
+                Whether to project contrast before every brain-guidance
+                evaluation (`"every_step"`) or only after the complete
+                denoising loop (`"final"`).
+            contrast_constraint_scope (`str`, *optional*, defaults to `"full_image"`):
+                Match only whole-image contrast, or match both whole-image
+                and soft-pRF-weighted contrast to the same target.
             negative_prompt (`str` or `List[str]`, *optional*):
                 The prompt or prompts not to guide the image generation. If not defined, one has to pass
                 `negative_prompt_embeds`. instead. If not defined, one has to pass `negative_prompt_embeds`. instead.
@@ -830,6 +946,26 @@ class mypipelineSAG(DiffusionPipeline):
             max_contrast=max_rms_contrast,
             target_contrast=target_rms_contrast,
         )
+        _validate_contrast_constraint_timing(contrast_constraint_timing)
+        _validate_contrast_constraint_scope(
+            contrast_constraint_scope,
+            contrast_constraint_method,
+            contrast_prf_weight,
+        )
+        if dual_scope_tolerance <= 0:
+            raise ValueError("dual_scope_tolerance must be positive.")
+        if dual_scope_solver_max_nfev <= 0:
+            raise ValueError("dual_scope_solver_max_nfev must be positive.")
+        if dual_scope_every_step_iterations <= 0:
+            raise ValueError(
+                "dual_scope_every_step_iterations must be positive."
+            )
+        if dual_scope_parameter_limit <= 0 or dual_scope_envelope_power <= 0:
+            raise ValueError(
+                "dual_scope_parameter_limit and dual_scope_envelope_power "
+                "must be positive."
+            )
+        self.last_contrast_diagnostics = None
         self.grad_diff = 0.0
 
         # 2. Define call parameters
@@ -961,9 +1097,16 @@ class mypipelineSAG(DiffusionPipeline):
                     noise_pred,
                     clip_guidance_scale,
                     contrast_constraint_method,
+                    contrast_constraint_timing,
+                    contrast_constraint_scope,
+                    contrast_prf_weight,
                     min_rms_contrast,
                     max_rms_contrast,
                     target_rms_contrast,
+                    dual_scope_tolerance,
+                    dual_scope_every_step_iterations,
+                    dual_scope_parameter_limit,
+                    dual_scope_envelope_power,
                 )
             # compute the previous noisy sample x_t -> x_t-1
             latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
@@ -982,19 +1125,44 @@ class mypipelineSAG(DiffusionPipeline):
         # 8. Post-processing
         # print(latents)
         image = self.decode_latents(latents)
+        image_tensor = torch.from_numpy(image).permute(0, 3, 1, 2)
+        require_finite_seed_image(image_tensor, stage="final decode")
         if contrast_constraint_method != "none":
-            image_tensor = torch.from_numpy(image).permute(0, 3, 1, 2)
-            image_tensor = apply_rms_contrast_constraint(
-                image_tensor,
-                method=contrast_constraint_method,
-                min_contrast=min_rms_contrast,
-                max_contrast=max_rms_contrast,
-                target_contrast=target_rms_contrast,
+            if contrast_constraint_scope == "full_image_and_prf":
+                contrast_result = match_global_and_prf_rms_contrast_final(
+                    image_tensor,
+                    contrast_prf_weight,
+                    target_rms_contrast,
+                    max_nfev=dual_scope_solver_max_nfev,
+                    tolerance=dual_scope_tolerance,
+                    parameter_limit=dual_scope_parameter_limit,
+                    adjustment_envelope_power=dual_scope_envelope_power,
+                )
+                require_converged(contrast_result, stage="final")
+                self.last_contrast_diagnostics = result_to_jsonable(
+                    contrast_result,
+                    target_rms_byte=target_rms_contrast * 255.0,
+                    tolerance_rms_byte=dual_scope_tolerance * 255.0,
+                )
+                image_tensor = contrast_result.images
+            else:
+                image_tensor = apply_rms_contrast_constraint(
+                    image_tensor,
+                    method=contrast_constraint_method,
+                    min_contrast=min_rms_contrast,
+                    max_contrast=max_rms_contrast,
+                    target_contrast=target_rms_contrast,
+                )
+            require_finite_seed_image(
+                image_tensor, stage="final contrast projection"
             )
             image = image_tensor.permute(0, 2, 3, 1).numpy()
 
         # 9. Run safety checker
         image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+        require_finite_seed_image(
+            torch.as_tensor(image), stage="safety-checker output"
+        )
 
         # 10. Convert to PIL
         if output_type == "pil":

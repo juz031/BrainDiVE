@@ -1,0 +1,123 @@
+schema_version: 1
+analysis_name: standard_mei_image_statistics
+subjects: [S1]
+backbones:
+  ADV_RN50:
+    current_dir: gen-ADV_RN50-concat__rank-OPEN_CLIP_RN50-concat
+    gradient_dir: ADV_RN50_gen__OPEN_CLIP_RN50_rank
+    generation_model_dir: ADV_RN50_set1
+    display_name: ADV-RN50
+    color: "#D95F4F"
+  DINO_RN50:
+    current_dir: gen-DINO_RN50-concat__rank-OPEN_CLIP_RN50-concat
+    gradient_dir: DINO_RN50_gen__OPEN_CLIP_RN50_rank
+    generation_model_dir: DINO_RN50_set1
+    display_name: DINO-RN50
+    color: "#4C63B6"
+rois: [V1, V2, V3, hV4]
+voxel_selection:
+  maximum_rank: 20
+images_per_voxel: 30
+conditions:
+  - id: current_mei
+    family: current
+    display_name: Current MEIs
+    color: "#D1495B"
+  - id: gradient_pixel_rms
+    family: gradient
+    method: pixel_rms
+    display_name: Gradient pixel RMS
+    color: "#8C6BB1"
+  - id: gradient_maco_rms
+    family: gradient
+    method: maco_rms
+    display_name: Gradient MACO RMS
+    color: "#6A51A3"
+  - id: gradient_maco_during_match
+    family: gradient
+    method: maco_during_match
+    display_name: Gradient MACO match
+    color: "#4A1486"
+  - id: nsd_measured_top
+    family: nsd
+    selection: measured
+    display_name: NSD measured top 30
+    color: "#2A9D8F"
+  - id: nsd_predicted_top
+    family: nsd
+    selection: predicted
+    display_name: NSD predicted top 30
+    color: "#E9A23B"
+excluded_gradient_methods: [pixel_raw, maco_raw]
+paths:
+  current_root: /user_data/junruz/BrainDiVE/contrast_con_concat/pRF_concat_model_ranked/sub-{subject_number_02}
+  gradient_root: /user_data/hanfeig/prf_max_activation/concat_seed1000_top50_openclip_rank/split_1_zscore/{subject}
+  model_root: /user_data/junruz/prf_models/concat/split_1_zscore
+  feature_root: /user_data/junruz/prf_features
+  nsd_root: /lab_data/hendersonlab/datasets/nsd_preproc
+  project_root: /home/junruz/BrainDiVE
+  legacy_image_stats: /home/junruz/BrainDiVE/analysis/image_stats
+  output_root: /user_data/junruz/BrainDiVE/contrast_con_concat/pRF_concat_model_ranked/sub-01/analysis/standard
+prf:
+  grid: default-log-polar
+  image_size: 256
+  display_degrees: 8.4
+test_model:
+  name: OPEN_CLIP_CONVNEXT_BASE
+  model_dir: OPEN_CLIP_CONVNEXT_BASE_set2
+  set: 2
+  layers: [stem, stage1, stage2, stage3, stage4]
+features:
+  image_size: 256
+  gabor:
+    spatial_frequencies_cycles_per_image: [4.0, 6.041239, 9.123941, 13.77918, 20.80952, 31.42680, 47.46185, 72.0]
+    orientations_degrees: [0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165]
+    spatial_frequency_bandwidth: 1.0
+    spatial_aspect_ratio: 1.0
+    n_sd_out: 3
+    padding_mode: reflect
+  curvature:
+    spatial_frequency_cycles_per_image: 40.0
+    orientations_degrees: [0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180, 195, 210, 225, 240, 255, 270, 285, 300, 315, 330, 345]
+    bends: [0.0, 0.03, 0.060613, 0.122474, 0.247462, 0.5]
+    spatial_frequency_bandwidth: 2.0
+    spatial_aspect_ratio: 0.2
+    n_sd_out: 3
+    padding_mode: reflect
+    edge_percentile: 90
+statistics:
+  primary_image_summary: median
+  sensitivity_rank_cutoffs: [1, 5, 10, 30]
+  permutation_iterations: 10000
+  bootstrap_iterations: 1000
+  random_seed: 20260828
+slurm:
+  conda_env: env2025
+  cpu_partition: cpu
+  gpu_partition: gpu
+  account: ""
+  array_max_concurrent: 40
+  basic:
+    partition: cpu
+    time: "01:00:00"
+    memory: 8G
+    cpus: 2
+    gpus: 0
+  gabor:
+    partition: gpu
+    time: "04:00:00"
+    memory: 16G
+    cpus: 4
+    gpus: 1
+  curvature:
+    partition: gpu
+    time: "08:00:00"
+    memory: 24G
+    cpus: 4
+    gpus: 1
+  final:
+    partition: cpu
+    time: "04:00:00"
+    memory: 32G
+    cpus: 8
+    gpus: 0

@@ -16,6 +16,12 @@ import pandas as pd
 import torch
 from diffusers import DiffusionPipeline, DPMSolverMultistepScheduler, LMSDiscreteScheduler
 from brain_guide_pipeline import mypipelineSAG
+from dual_scope_contrast_utils import (
+    DualScopeContrastConvergenceError,
+    global_luma_mean_and_rms,
+    normalized_prf_weight,
+    weighted_luma_mean_and_rms,
+)
 import pickle
 import gc
 
@@ -24,7 +30,8 @@ import os
 
 import argparse
 from torchvision.models.feature_extraction import create_feature_extractor
-from prf_utils import get_prf_stack
+from prf_utils import get_prf_grid, get_prf_stack
+from voxel_selection import select_voxels_by_rank
 import random
 from base64 import b64encode
 random.seed(a=b64encode(os.urandom(5)).decode('utf-8'))
@@ -44,6 +51,42 @@ import model_fitting_utils
 
 
 _PRF_STACK_CACHE = {}
+
+
+MODEL_PROVENANCE = {
+    "CLIP_RN50": {
+        "library": "clip",
+        "architecture": "RN50",
+        "pretrained": "OpenAI",
+    },
+    "OPEN_CLIP_RN50": {
+        "library": "open_clip",
+        "architecture": "RN50",
+        "pretrained": "yfcc15m",
+        "force_quick_gelu": True,
+    },
+    "DINO_RN50": {
+        "library": "torch.hub",
+        "architecture": "dino_resnet50",
+        "repository": "facebookresearch/dino:main",
+    },
+    "SIMCLR_RN50": {
+        "library": "huggingface_hub/torchvision",
+        "architecture": "resnet50",
+        "repository": "lightly-ai/simclrv1-imagenet1k-resnet50-1x",
+        "checkpoint": "resnet50-1x.pth",
+    },
+    "ADV_RN50": {
+        "library": "robustness/torchvision",
+        "architecture": "resnet50",
+        "checkpoint": "/user_data/junruz/prf_features/imagenet_l2_3_0.pt",
+    },
+    "OPEN_CLIP_CONVNEXT_BASE": {
+        "library": "open_clip",
+        "architecture": "convnext_base",
+        "pretrained": "laion400m_s13b_b51k",
+    },
+}
 
 
 
@@ -446,14 +489,229 @@ def pool_concatenated_features(extracted, layer_names, prf_kernels):
     return torch.cat(pooled, dim=1)
 
 
+def save_online_ranking_model(
+    output_folder,
+    *,
+    subject_id,
+    region,
+    voxel_id,
+    voxel_index_in_region,
+    voxel_rank,
+    voxel_r2,
+    generation_model_name,
+    model_name,
+    split_id,
+    metadata,
+    layer_sizes,
+    prf_idx,
+    prf_grid_name,
+    prf_params,
+    weights,
+    intercept,
+    feature_mean,
+    feature_std,
+    channel_indices,
+    lambda_candidates,
+    best_lambda_index,
+    nested_sse,
+    train_ids,
+    val_ids,
+    nest_ids,
+    features_model_folder,
+    ranking_model_path,
+    data_splits_path,
+):
+    """Save a complete, per-voxel online ranking-model artifact."""
+    os.makedirs(output_folder, exist_ok=True)
+
+    parameters_filename = "parameters.npz"
+    metadata_filename = "model.json"
+    parameters_path = os.path.join(output_folder, parameters_filename)
+    metadata_path = os.path.join(output_folder, metadata_filename)
+
+    weights_array = np.asarray(weights, dtype=np.float64).reshape(-1)
+    intercept_array = np.asarray(intercept, dtype=np.float64).reshape(())
+    feature_mean_array = np.asarray(feature_mean, dtype=np.float64).reshape(-1)
+    feature_std_array = np.asarray(feature_std, dtype=np.float64).reshape(-1)
+    channel_indices_array = np.asarray(channel_indices, dtype=np.int64).reshape(-1)
+    lambda_candidates_array = np.asarray(
+        lambda_candidates, dtype=np.float64
+    ).reshape(-1)
+    best_lambda_index = int(
+        np.asarray(best_lambda_index).reshape(-1)[0]
+    )
+    nested_sse = float(np.asarray(nested_sse).reshape(-1)[0])
+
+    num_features = int(metadata["num_features"])
+    expected_shape = (num_features,)
+    for array_name, array in (
+        ("weights", weights_array),
+        ("feature_mean", feature_mean_array),
+        ("feature_std", feature_std_array),
+        ("channel_indices", channel_indices_array),
+    ):
+        if array.shape != expected_shape:
+            raise ValueError(
+                f"Online ranking {array_name} has shape {array.shape}; "
+                f"expected {expected_shape}"
+            )
+    if not 0 <= best_lambda_index < len(lambda_candidates_array):
+        raise IndexError(
+            f"Best lambda index {best_lambda_index} is outside a grid of "
+            f"length {len(lambda_candidates_array)}"
+        )
+
+    train_ids_array = np.asarray(train_ids, dtype=np.int64).reshape(-1)
+    val_ids_array = np.asarray(val_ids, dtype=np.int64).reshape(-1)
+    nest_ids_array = np.asarray(nest_ids, dtype=np.int64).reshape(-1)
+    partial_parameters_path = parameters_path + ".partial.npz"
+    np.savez_compressed(
+        partial_parameters_path,
+        weights=weights_array,
+        intercept=intercept_array,
+        feature_mean=feature_mean_array,
+        feature_std=feature_std_array,
+        channel_indices=channel_indices_array,
+        lambda_candidates=lambda_candidates_array,
+        best_lambda_index=np.asarray(best_lambda_index, dtype=np.int64),
+        best_lambda=np.asarray(
+            lambda_candidates_array[best_lambda_index], dtype=np.float64
+        ),
+        nested_sse=np.asarray(nested_sse, dtype=np.float64),
+        train_ids=train_ids_array,
+        validation_ids=val_ids_array,
+        nested_ids=nest_ids_array,
+    )
+
+    layer_names = list(metadata["layers"])
+    layer_layout = []
+    for layer_name in layer_names:
+        channels, height, width = (
+            int(value) for value in layer_sizes[layer_name]
+        )
+        layer_layout.append({
+            "name": layer_name,
+            "channels": channels,
+            "height": height,
+            "width": width,
+            "feature_slice": list(metadata["feature_slices"][layer_name]),
+        })
+
+    prf_x, prf_y, prf_sigma = (
+        float(value) for value in np.asarray(prf_params).reshape(3)
+    )
+    payload = {
+        "schema_version": 1,
+        "artifact_type": "braindive_online_voxel_ranking_model",
+        "subject": int(subject_id),
+        "region": str(region),
+        "voxel": {
+            "id": int(voxel_id),
+            "index_in_region": int(voxel_index_in_region),
+            "generation_model_r2_rank": int(voxel_rank),
+            "generation_model_r2": float(voxel_r2),
+        },
+        "ranking_encoder": {
+            "name": model_name,
+            "online_voxel_readout_fit": True,
+            "pretrained_backbone_parameters_included": False,
+            "provenance": MODEL_PROVENANCE.get(model_name, {}),
+            "checkpoint_folder": os.path.abspath(ranking_model_path),
+            "checkpoint_concat_metadata": metadata,
+            "input": {
+                "color_space": "RGB",
+                "range": [0.0, 1.0],
+                "resize": [224, 224],
+                "resize_mode": "bilinear",
+                "antialias": True,
+                "mean": getattr(
+                    Normalize, f"{model_name}_MEAN"
+                ).reshape(-1).astype(float).tolist(),
+                "std": getattr(
+                    Normalize, f"{model_name}_STD"
+                ).reshape(-1).astype(float).tolist(),
+            },
+            "concatenation_order": layer_names,
+            "layers": layer_layout,
+            "num_features": num_features,
+        },
+        "prf": {
+            "source": "generation_model_best_prf_idx",
+            "generation_model_name": generation_model_name,
+            "shared_with_generation_model": True,
+            "grid_name": prf_grid_name,
+            "id": int(prf_idx),
+            "x_aperture_units": prf_x,
+            "y_aperture_units": prf_y,
+            "sigma_aperture_units": prf_sigma,
+            "nsd_aperture_degrees": 8.4,
+            "x_degrees": prf_x * 8.4,
+            "y_degrees": prf_y * 8.4,
+            "sigma_degrees": prf_sigma * 8.4,
+            "pooling": "normalized_isotropic_gaussian_weighted_mean",
+            "rasterized_at_each_layer_native_resolution": True,
+        },
+        "fit": {
+            "model_type": "ridge_regression_with_intercept",
+            "target": "NSD averaged beta response for this voxel",
+            "split_id": int(split_id),
+            "feature_normalization": "per-channel z-score",
+            "normalization_statistics_partition": "train_plus_nested",
+            "weights_fit_partition": "train",
+            "lambda_selection_partition": "nested",
+            "validation_partition_used_during_fit": False,
+            "intercept_in_ridge_penalty": True,
+            "ridge_solver_epsilon": 1e-4,
+            "best_lambda_index": best_lambda_index,
+            "best_lambda": float(
+                lambda_candidates_array[best_lambda_index]
+            ),
+            "best_nested_sse": nested_sse,
+            "partition_counts": {
+                "train": int(len(train_ids_array)),
+                "validation": int(len(val_ids_array)),
+                "nested": int(len(nest_ids_array)),
+            },
+            "prediction_equation": (
+                "score = dot((features - feature_mean) / feature_std, "
+                "weights) + intercept"
+            ),
+        },
+        "source_data": {
+            "precomputed_feature_folder": os.path.abspath(
+                features_model_folder
+            ),
+            "data_splits_file": os.path.abspath(data_splits_path),
+        },
+        "artifacts": {
+            "parameters_file": parameters_filename,
+            "parameter_arrays": {
+                "weights": "float64[num_features]",
+                "intercept": "float64 scalar",
+                "feature_mean": "float64[num_features]",
+                "feature_std": "float64[num_features]",
+                "channel_indices": "int64[num_features]",
+                "lambda_candidates": "float64[num_lambdas]",
+                "best_lambda_index": "int64 scalar",
+                "best_lambda": "float64 scalar",
+                "nested_sse": "float64 scalar",
+                "train_ids": "int64[num_train_images]",
+                "validation_ids": "int64[num_validation_images]",
+                "nested_ids": "int64[num_nested_images]",
+            },
+        },
+    }
+    partial_metadata_path = metadata_path + ".partial"
+    with open(partial_metadata_path, "w") as metadata_handle:
+        json.dump(payload, metadata_handle, indent=2, allow_nan=False)
+    os.replace(partial_parameters_path, parameters_path)
+    os.replace(partial_metadata_path, metadata_path)
+
+    return metadata_path, parameters_path
+
+
 def rank_model_fitting(voxel_id, best_prf_idx, voxel_data, train_ids, val_ids, nest_ids, features_model_folder, layer_names, device):
-    """
-    Return:
-    - best_prf_idx: list of length of num_voxels, the index of the best pRF for each voxel
-    - best_lambda: list of length of num_voxels, the best lambda for each voxel for the best pRF
-    - best_loss: list of length of num_voxels, the best r2 for each voxel for the best pRF
-    - best_weights: array of length of [num_voxels, num_features + 1], the best weights for each voxel for the best pRF, with the intercept
-    """
+    """Fit one online concatenated-feature ridge readout for ranking."""
 
     train_voxel = voxel_data[train_ids, voxel_id]
     nest_voxel = voxel_data[nest_ids, voxel_id]
@@ -490,7 +748,15 @@ def rank_model_fitting(voxel_id, best_prf_idx, voxel_data, train_ids, val_ids, n
     # best_weights, best_lambda_idx, best_nest_loss = model_fitting_utils.solve_ridge_svd(train_features, train_voxel, nest_features, nest_voxel, lambdas, eps=1e-4, return_loss=True)
 
 
-    return best_weights, channel_kept, best_lambda_idx, features_s, features_m
+    return (
+        best_weights,
+        channel_kept,
+        best_lambda_idx,
+        best_nest_loss,
+        lambdas,
+        features_s,
+        features_m,
+    )
 
 
 def main():
@@ -513,6 +779,11 @@ def main():
     parser.add_argument('--roi', nargs='+', default=["V1"], type=str)
     parser.add_argument('--k', type=int, default=3, help="Top k voxels to keep in the region")
     parser.add_argument(
+        '--voxel_rank_range', nargs=2, type=int, metavar=('START', 'END'),
+        help=("Inclusive 1-based voxel rank range; overrides --k. "
+              "For example, --voxel_rank_range 6 10 selects ranks 6-10."),
+    )
+    parser.add_argument(
         '--r2_noise_ceiling_threshold',
         type=float,
         default=0.0,
@@ -525,6 +796,15 @@ def main():
     parser.add_argument('--num_steps', type=int, default=100)
     parser.add_argument('--brain_guidance_scale', type=float, default=30)
     parser.add_argument(
+        '--sag_scale',
+        type=float,
+        default=0.75,
+        help=(
+            "Self-attention guidance scale. 0 disables SAG; BrainDiVE default "
+            "is 0.75."
+        ),
+    )
+    parser.add_argument(
         '--contrast_constraint_method',
         choices=['none', 'max', 'range', 'match'],
         default='range',
@@ -532,6 +812,25 @@ def main():
             "Contrast projection to use: 'none' disables it, 'max' caps RMS "
             "contrast, 'range' keeps it between lower/upper bounds, and "
             "'match' projects every image to one target RMS contrast."
+        ),
+    )
+    parser.add_argument(
+        '--contrast_constraint_timing',
+        choices=['every_step', 'final'],
+        default='every_step',
+        help=(
+            "Apply the selected contrast constraint before every "
+            "brain-guidance evaluation or only once after the final "
+            "diffusion step."
+        ),
+    )
+    parser.add_argument(
+        '--contrast_constraint_scope',
+        choices=['full_image', 'full_image_and_prf'],
+        default='full_image',
+        help=(
+            "Constrain only full-image RMS contrast, or constrain both "
+            "full-image and soft-pRF-weighted RMS contrast to the same target."
         ),
     )
     parser.add_argument(
@@ -579,6 +878,11 @@ def main():
     parser.add_argument('--num_seeds', type=int, default=3)
     parser.add_argument('--ranking_top_n', type=int, default=5)
     parser.add_argument(
+        '--generation_timing_file', type=str, default=None,
+        help=("Optional JSON output for time spent only inside diffusion "
+              "pipeline calls; CUDA is synchronized around every call."),
+    )
+    parser.add_argument(
         '--max_generation_attempts',
         type=int,
         default=None,
@@ -590,12 +894,18 @@ def main():
     parser.add_argument(
         '--contrast_validation_tolerance',
         type=float,
-        default=0.5,
+        default=0.01,
         help=(
-            "Allowed RMS-contrast error for generated candidates in 0-255 "
-            "pixel units."
+            "Allowed unquantized-float RMS-contrast error in 0-255 pixel "
+            "units. The reference dual-scope experiment uses 0.01."
         ),
     )
+    parser.add_argument('--dual_scope_solver_max_nfev', type=int, default=300)
+    parser.add_argument(
+        '--dual_scope_every_step_iterations', type=int, default=10
+    )
+    parser.add_argument('--dual_scope_parameter_limit', type=float, default=8.0)
+    parser.add_argument('--dual_scope_envelope_power', type=float, default=0.5)
     parser.add_argument('--save_root', type=str, default="/user_data/junruz/BrainDiVE/pRF_concat_model_ranked")
     args = parser.parse_args()
 
@@ -607,8 +917,24 @@ def main():
         and args.max_generation_attempts < args.num_seeds
     ):
         parser.error("--max_generation_attempts cannot be less than --num_seeds")
-    if args.contrast_validation_tolerance < 0:
-        parser.error("--contrast_validation_tolerance must be non-negative")
+    if args.contrast_validation_tolerance <= 0:
+        parser.error("--contrast_validation_tolerance must be positive")
+    if (
+        args.contrast_constraint_scope == 'full_image_and_prf'
+        and args.contrast_constraint_method != 'match'
+    ):
+        parser.error(
+            "--contrast_constraint_scope full_image_and_prf requires "
+            "--contrast_constraint_method match"
+        )
+    if args.dual_scope_solver_max_nfev <= 0:
+        parser.error("--dual_scope_solver_max_nfev must be positive")
+    if args.dual_scope_every_step_iterations <= 0:
+        parser.error("--dual_scope_every_step_iterations must be positive")
+    if args.dual_scope_parameter_limit <= 0:
+        parser.error("--dual_scope_parameter_limit must be positive")
+    if args.dual_scope_envelope_power <= 0:
+        parser.error("--dual_scope_envelope_power must be positive")
 
     contrast_stats_path = None
     percentile_values = None
@@ -707,7 +1033,9 @@ def main():
     print(
         f"Using Rec.709 RMS contrast method "
         f"{args.contrast_constraint_method!r}: {contrast_description} "
-        "in 0-255 pixel units"
+        f"in 0-255 pixel units; timing={args.contrast_constraint_timing!r}; "
+        f"scope={args.contrast_constraint_scope!r}; float tolerance="
+        f"{args.contrast_validation_tolerance:g} byte"
     )
 
     def path_component(value):
@@ -861,7 +1189,8 @@ def main():
     # Load rois masks
     roi_masks, noise_ceiling = load_nsd_rois(ss, args)
     split_dir = os.path.join(args.model_root, f'S{ss}')
-    with open(os.path.join(split_dir, f'data_splits_S{ss}.pkl'), 'rb') as f:
+    data_splits_path = os.path.join(split_dir, f'data_splits_S{ss}.pkl')
+    with open(data_splits_path, 'rb') as f:
         data_splits = pickle.load(f)
     ids = data_splits[args.split_id]
     train_ids, val_ids, nest_ids = ids['train'], ids['val'], ids['nest']
@@ -881,7 +1210,8 @@ def main():
     # random.seed(a=b64encode(os.urandom(5)).decode('utf-8'))
     # random.shuffle(regions)
 
-
+    generation_timing = {"seconds": 0.0, "calls": 0}
+    prf_grid_params, prf_grid_name = get_prf_grid("default-log-polar")
     for region in regions:
         print("Starting S{} {}".format(ss, region))
         # random.seed(a=b64encode(os.urandom(5)).decode('utf-8'))
@@ -938,14 +1268,15 @@ def main():
                     "Check that r2.pkl and --roi_path belong to the same "
                     "subject/model evaluation."
                 )
-        # Get the top 5 values and their indices in r2_voxels
-        topk_indices = np.argsort(r2_voxels)[-args.k:][::-1]
-        topk_values = r2_voxels[topk_indices]
-        print(f"Top 5 r2_voxels values for {region}: {topk_values}")
+        topk_indices, topk_values, voxel_ranks = select_voxels_by_rank(
+            r2_voxels, args.k, args.voxel_rank_range
+        )
+        print(f"Voxel ranks {voxel_ranks[0]}-{voxel_ranks[-1]} r2 values "
+              f"for {region}: {topk_values}")
         print(f"Corresponding indices: {topk_indices}")
 
         
-        for i, idx in enumerate(topk_indices):
+        for i, (voxel_rank, idx) in enumerate(zip(voxel_ranks, topk_indices)):
             voxel_id = int(region_voxel_ids[idx])
             voxel_key = str(voxel_id)
             weights = best_weights[voxel_key][:-1]
@@ -967,6 +1298,14 @@ def main():
                 )
             gen_prf_kernels = build_prf_kernels(
                 gen_layer_names, gen_layer_sizes, prf_idx, device
+            )
+            contrast_prf_layer = max(
+                gen_layer_names,
+                key=lambda layer_name: gen_layer_sizes[layer_name][-1],
+            )
+            contrast_prf_weight = gen_prf_kernels[contrast_prf_layer]
+            contrast_prf_native_size = list(
+                gen_layer_sizes[contrast_prf_layer][-2:]
             )
             if weights.shape[1] != int(gen_metadata["num_features"]):
                 raise ValueError(
@@ -1026,6 +1365,7 @@ def main():
 
             num_steps = args.num_steps
             brain_guidance_scale = args.brain_guidance_scale
+            sag_scale = args.sag_scale
             model_folder = (
                 f"gen-{path_component(args.gen_model)}-concat"
                 f"__rank-{path_component(args.rank_model)}-concat"
@@ -1045,8 +1385,11 @@ def main():
                 f"split-{args.split_id:02d}"
                 f"__steps-{num_steps}"
                 f"__scale-{brain_guidance_scale:g}"
+                f"__sag-{sag_scale:g}"
                 f"__contrast-{contrast_folder}"
-                f"__k-{args.k}__seeds-{args.num_seeds}"
+                f"__scope-{args.contrast_constraint_scope}"
+                f"__contrast-timing-{args.contrast_constraint_timing}"
+                f"__seeds-{args.num_seeds}"
                 f"__keep-{args.ranking_top_n}"
             )
             experiment_folder = os.path.join(
@@ -1061,7 +1404,7 @@ def main():
             )
             voxel_folder = os.path.join(
                 region_folder,
-                f"voxel-rank-{i + 1:02d}__id-{voxel_id:06d}",
+                f"voxel-rank-{voxel_rank:02d}__id-{voxel_id:06d}",
             )
             images_folder = os.path.join(voxel_folder, "images")
             os.makedirs(images_folder, exist_ok=True)
@@ -1086,8 +1429,12 @@ def main():
                             "generation": {
                                 "num_steps": int(num_steps),
                                 "brain_guidance_scale": float(brain_guidance_scale),
+                                "sag_scale": float(sag_scale),
                                 "num_seeds": int(args.num_seeds),
-                                "top_k_voxels": int(args.k),
+                                "top_k_voxels": int(len(voxel_ranks)),
+                                "voxel_rank_start": int(voxel_ranks[0]),
+                                "voxel_rank_end": int(voxel_ranks[-1]),
+                                "voxel_count": int(len(voxel_ranks)),
                                 "ranking_top_n": int(args.ranking_top_n),
                                 "max_generation_attempts": (
                                     int(args.max_generation_attempts)
@@ -1100,6 +1447,12 @@ def main():
                             },
                             "contrast": {
                                 "method": args.contrast_constraint_method,
+                                "timing": args.contrast_constraint_timing,
+                                "scope": args.contrast_constraint_scope,
+                                "acceptance_domain": "unquantized_float",
+                                "acceptance_tolerance_byte": float(
+                                    args.contrast_validation_tolerance
+                                ),
                                 "statistics_json": (
                                     os.path.abspath(contrast_stats_path)
                                     if contrast_stats_path is not None
@@ -1129,6 +1482,31 @@ def main():
                                     if args.target_rms_contrast is not None
                                     else None
                                 ),
+                                "dual_scope": {
+                                    "prf_source": (
+                                        "generation_model_selected_prf"
+                                    ),
+                                    "prf_layer_selection": (
+                                        "highest_spatial_resolution_"
+                                        "concatenated_generation_layer"
+                                    ),
+                                    "prf_layer": contrast_prf_layer,
+                                    "prf_native_size": contrast_prf_native_size,
+                                    "resize_to_decoded_image": "bilinear",
+                                    "normalize_weight_sum": 1.0,
+                                    "solver_max_nfev": int(
+                                        args.dual_scope_solver_max_nfev
+                                    ),
+                                    "every_step_iterations": int(
+                                        args.dual_scope_every_step_iterations
+                                    ),
+                                    "parameter_limit": float(
+                                        args.dual_scope_parameter_limit
+                                    ),
+                                    "adjustment_envelope_power": float(
+                                        args.dual_scope_envelope_power
+                                    ),
+                                },
                             },
                             "regions": list(args.roi),
                         },
@@ -1146,6 +1524,10 @@ def main():
                 "out_of_range_pixels": 0,
                 "degenerate_contrast": 0,
                 "contrast_mismatch": 0,
+                "global_contrast_mismatch": 0,
+                "prf_contrast_mismatch": 0,
+                "dual_scope_solver_failure": 0,
+                "nonfinite_dual_scope_parameters": 0,
                 "nonfinite_gen_score": 0,
                 "nonfinite_rank_score": 0,
             }
@@ -1164,42 +1546,90 @@ def main():
                 if image_array.min() < -1e-6 or image_array.max() > 1.0 + 1e-6:
                     return "out_of_range_pixels", None
 
-                # Validate the quantized pixels that will actually be saved,
-                # rather than only the higher-precision pipeline output.
-                validation_array = (
+                float_tensor = torch.from_numpy(
+                    np.ascontiguousarray(image_array)
+                ).permute(2, 0, 1)[None].to(dtype=torch.float64)
+                _, global_rms = global_luma_mean_and_rms(float_tensor)
+                global_rms = float(global_rms[0])
+                prf_rms = None
+                validation_weight = None
+                if args.contrast_constraint_scope == "full_image_and_prf":
+                    validation_weight = normalized_prf_weight(
+                        contrast_prf_weight.detach().cpu(), float_tensor
+                    )
+                    _, prf_value = weighted_luma_mean_and_rms(
+                        float_tensor, validation_weight
+                    )
+                    prf_rms = float(prf_value[0])
+
+                quantized_array = (
                     np.rint(np.clip(image_array, 0, 1) * 255.0) / 255.0
                 )
-                luminance = np.einsum(
-                    "hwc,c->hw",
-                    validation_array.astype(np.float64, copy=False),
-                    np.array((0.2126, 0.7152, 0.0722), dtype=np.float64),
+                quantized_tensor = torch.from_numpy(
+                    np.ascontiguousarray(quantized_array)
+                ).permute(2, 0, 1)[None].to(dtype=torch.float64)
+                _, quantized_global = global_luma_mean_and_rms(
+                    quantized_tensor
                 )
-                rms_contrast = float(luminance.std())
-                if not np.isfinite(rms_contrast) or rms_contrast <= 1e-8:
-                    return "degenerate_contrast", rms_contrast
+                quantized_global = float(quantized_global[0])
+                quantized_prf = None
+                if validation_weight is not None:
+                    _, quantized_prf_value = weighted_luma_mean_and_rms(
+                        quantized_tensor, validation_weight
+                    )
+                    quantized_prf = float(quantized_prf_value[0])
+
+                metrics = {
+                    "float_global_rms_byte": global_rms * 255.0,
+                    "float_prf_rms_byte": (
+                        prf_rms * 255.0 if prf_rms is not None else None
+                    ),
+                    "png_global_rms_byte": quantized_global * 255.0,
+                    "png_prf_rms_byte": (
+                        quantized_prf * 255.0
+                        if quantized_prf is not None
+                        else None
+                    ),
+                }
+                if (
+                    not np.isfinite(global_rms)
+                    or global_rms <= 1e-8
+                    or (
+                        prf_rms is not None
+                        and (not np.isfinite(prf_rms) or prf_rms <= 1e-8)
+                    )
+                ):
+                    return "degenerate_contrast", metrics
 
                 if args.contrast_constraint_method == "match":
-                    valid_contrast = (
-                        abs(rms_contrast - args.target_rms_contrast / 255.0)
-                        <= contrast_tolerance
-                    )
+                    target = args.target_rms_contrast / 255.0
+                    if abs(global_rms - target) > contrast_tolerance:
+                        return "global_contrast_mismatch", metrics
+                    if (
+                        prf_rms is not None
+                        and abs(prf_rms - target) > contrast_tolerance
+                    ):
+                        return "prf_contrast_mismatch", metrics
                 elif args.contrast_constraint_method == "max":
                     valid_contrast = (
-                        rms_contrast
+                        global_rms
                         <= args.max_rms_contrast / 255.0 + contrast_tolerance
                     )
                 elif args.contrast_constraint_method == "range":
                     valid_contrast = (
-                        rms_contrast
+                        global_rms
                         >= args.min_rms_contrast / 255.0 - contrast_tolerance
-                        and rms_contrast
+                        and global_rms
                         <= args.max_rms_contrast / 255.0 + contrast_tolerance
                     )
                 else:
                     valid_contrast = True
-                if not valid_contrast:
-                    return "contrast_mismatch", rms_contrast
-                return None, rms_contrast
+                if (
+                    args.contrast_constraint_method != "match"
+                    and not valid_contrast
+                ):
+                    return "contrast_mismatch", metrics
+                return None, metrics
 
             def generate_pixel_valid_candidates(number_needed):
                 generated = []
@@ -1218,40 +1648,84 @@ def main():
                         f"{args.num_seeds})"
                     )
                     g = torch.Generator(device=device).manual_seed(int(seed))
-                    image = pipe(
-                        "",
-                        sag_scale=0.75,
-                        guidance_scale=0.0,
-                        num_inference_steps=num_steps,
-                        generator=g,
-                        clip_guidance_scale=brain_guidance_scale,
-                        contrast_constraint_method=args.contrast_constraint_method,
-                        min_rms_contrast=(
-                            args.min_rms_contrast / 255.0
-                            if args.min_rms_contrast is not None
-                            else None
-                        ),
-                        max_rms_contrast=(
-                            args.max_rms_contrast / 255.0
-                            if args.max_rms_contrast is not None
-                            else None
-                        ),
-                        target_rms_contrast=(
-                            args.target_rms_contrast / 255.0
-                            if args.target_rms_contrast is not None
-                            else None
-                        ),
-                        output_type="np",
-                    )
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(device)
+                    generation_start = time.perf_counter()
+                    try:
+                        try:
+                            image = pipe(
+                                "",
+                                sag_scale=sag_scale,
+                                guidance_scale=0.0,
+                                num_inference_steps=num_steps,
+                                generator=g,
+                                clip_guidance_scale=brain_guidance_scale,
+                                contrast_constraint_method=(
+                                    args.contrast_constraint_method
+                                ),
+                                contrast_constraint_timing=(
+                                    args.contrast_constraint_timing
+                                ),
+                                contrast_constraint_scope=(
+                                    args.contrast_constraint_scope
+                                ),
+                                contrast_prf_weight=contrast_prf_weight,
+                                min_rms_contrast=(
+                                    args.min_rms_contrast / 255.0
+                                    if args.min_rms_contrast is not None
+                                    else None
+                                ),
+                                max_rms_contrast=(
+                                    args.max_rms_contrast / 255.0
+                                    if args.max_rms_contrast is not None
+                                    else None
+                                ),
+                                target_rms_contrast=(
+                                    args.target_rms_contrast / 255.0
+                                    if args.target_rms_contrast is not None
+                                    else None
+                                ),
+                                dual_scope_tolerance=contrast_tolerance,
+                                dual_scope_solver_max_nfev=(
+                                    args.dual_scope_solver_max_nfev
+                                ),
+                                dual_scope_every_step_iterations=(
+                                    args.dual_scope_every_step_iterations
+                                ),
+                                dual_scope_parameter_limit=(
+                                    args.dual_scope_parameter_limit
+                                ),
+                                dual_scope_envelope_power=(
+                                    args.dual_scope_envelope_power
+                                ),
+                                output_type="np",
+                            )
+                        finally:
+                            if device.type == "cuda":
+                                torch.cuda.synchronize(device)
+                            generation_timing["seconds"] += (
+                                time.perf_counter() - generation_start
+                            )
+                            generation_timing["calls"] += 1
+                    except DualScopeContrastConvergenceError as error:
+                        rejected_candidates[error.reason] += 1
+                        print(
+                            f"Rejected seed {seed}: {error.reason} ({error})"
+                        )
+                        continue
                     image_array = np.asarray(image.images[0], dtype=np.float32)
-                    reason, rms_contrast = candidate_rejection_reason(image_array)
+                    reason, contrast_metrics = candidate_rejection_reason(
+                        image_array
+                    )
                     if reason is not None:
                         rejected_candidates[reason] += 1
                         print(
                             f"Rejected seed {seed}: {reason}"
                             + (
-                                f" (RMS={rms_contrast * 255.0:.4f})"
-                                if rms_contrast is not None
+                                " (global RMS="
+                                f"{contrast_metrics['float_global_rms_byte']:.6f}"
+                                " byte)"
+                                if contrast_metrics is not None
                                 else ""
                             )
                         )
@@ -1261,20 +1735,32 @@ def main():
                         "tensor": torch.from_numpy(
                             np.ascontiguousarray(image_array)
                         ).permute(2, 0, 1),
-                        "rms_contrast_byte": rms_contrast * 255.0,
+                        "rms_contrast_byte": contrast_metrics[
+                            "float_global_rms_byte"
+                        ],
+                        "contrast_diagnostics": contrast_metrics,
+                        "dual_scope_solver": (
+                            dict(pipe.last_contrast_diagnostics)
+                            if pipe.last_contrast_diagnostics is not None
+                            else None
+                        ),
                     })
                 return generated
 
             pending_records = generate_pixel_valid_candidates(args.num_seeds)
             if len(pending_records) < args.num_seeds:
-                raise RuntimeError(
+                print(
+                    "Generation attempt limit reached before collecting the "
+                    "requested number of pixel-valid candidates; ranking the "
+                    "accepted candidates that are available. "
                     f"Only generated {len(pending_records)} pixel-valid "
                     f"candidates for {region} voxel {voxel_id} after "
                     f"{len(attempted_seeds)} attempts "
                     f"(limit {max_generation_attempts}). "
                     f"Rejections: {rejected_candidates}"
                 )
-            
+
+
             ############## Train the ranking model based on voxel id #########################################
             features_model_folder = os.path.join(
                 args.feature_root,
@@ -1286,7 +1772,15 @@ def main():
                 f"{features_model_folder} ({', '.join(rank_layer_names)})"
             )
 
-            rank_weights, rank_channel_kept, best_lambda_idx, rank_features_s, rank_features_m = rank_model_fitting(
+            (
+                rank_weights,
+                rank_channel_kept,
+                best_lambda_idx,
+                best_nest_loss,
+                rank_lambdas,
+                rank_features_s,
+                rank_features_m,
+            ) = rank_model_fitting(
                 voxel_id,
                 prf_idx,
                 voxel_data,
@@ -1316,7 +1810,51 @@ def main():
                     f"but metadata expects {rank_metadata['num_features']}"
                 )
 
-            while len(image_records) < args.num_seeds:
+            ranking_model_folder = os.path.join(
+                voxel_folder, "ranking_model"
+            )
+            ranking_model_metadata_path, ranking_model_parameters_path = (
+                save_online_ranking_model(
+                    ranking_model_folder,
+                    subject_id=ss,
+                    region=region,
+                    voxel_id=voxel_id,
+                    voxel_index_in_region=idx,
+                    voxel_rank=voxel_rank,
+                    voxel_r2=topk_values[i],
+                    generation_model_name=args.gen_model,
+                    model_name=args.rank_model,
+                    split_id=args.split_id,
+                    metadata=rank_metadata,
+                    layer_sizes=rank_layer_sizes,
+                    prf_idx=prf_idx,
+                    prf_grid_name=prf_grid_name,
+                    prf_params=prf_grid_params[int(prf_idx)],
+                    weights=rank_weights.detach().cpu().numpy(),
+                    intercept=rank_intercept.detach().cpu().numpy(),
+                    feature_mean=rank_features_m.detach().cpu().numpy(),
+                    feature_std=rank_features_s.detach().cpu().numpy(),
+                    channel_indices=rank_channel_kept,
+                    lambda_candidates=rank_lambdas,
+                    best_lambda_index=best_lambda_idx,
+                    nested_sse=best_nest_loss,
+                    train_ids=train_ids,
+                    val_ids=val_ids,
+                    nest_ids=nest_ids,
+                    features_model_folder=features_model_folder,
+                    ranking_model_path=rank_model_path,
+                    data_splits_path=data_splits_path,
+                )
+            )
+            print(
+                f"Saved online ranking model for {region} voxel {voxel_id}: "
+                f"{ranking_model_metadata_path}"
+            )
+
+            while (
+                len(image_records) < args.num_seeds
+                and len(pending_records) > 0
+            ):
                 gen_scores = score_generated_images_for_voxel(
                     image_records=pending_records,
                     layer_names=gen_layer_names,
@@ -1368,13 +1906,17 @@ def main():
                 missing = args.num_seeds - len(image_records)
                 pending_records = generate_pixel_valid_candidates(missing)
                 if not pending_records:
-                    raise RuntimeError(
+                    print(
+                        "Generation attempt limit reached before collecting "
+                        "the requested number of fully valid candidates; "
+                        "ranking the accepted candidates that are available. "
                         f"Only generated {len(image_records)} fully valid "
                         f"candidates for {region} voxel {voxel_id} after "
                         f"{len(attempted_seeds)} attempts "
                         f"(limit {max_generation_attempts}). "
                         f"Rejections: {rejected_candidates}"
                     )
+                    break
 
             ranked_indices = sorted(
                 range(len(image_records)),
@@ -1382,8 +1924,8 @@ def main():
                 reverse=True,
             )
 
-            top_n = max(1, int(args.ranking_top_n))
-            top_n = min(top_n, len(ranked_indices))
+            requested_top_n = max(1, int(args.ranking_top_n))
+            top_n = min(requested_top_n, len(ranked_indices))
             top_ranked = []
             for rank_idx, img_idx in enumerate(ranked_indices[:top_n], start=1):
                 item = image_records[img_idx]
@@ -1404,6 +1946,8 @@ def main():
                     "gen_score": item["gen_score"],
                     "rank_score": item["rank_score"],
                     "rms_contrast_byte": item["rms_contrast_byte"],
+                    "contrast_diagnostics": item["contrast_diagnostics"],
+                    "dual_scope_solver": item["dual_scope_solver"],
                     "image_file": os.path.join("images", ranked_image_name),
                     "image_path": os.path.abspath(ranked_image_path),
                 })
@@ -1412,21 +1956,82 @@ def main():
             with open(ranking_file, "w") as f:
                 json.dump(
                     {
-                        "schema_version": 3,
+                        "schema_version": 6,
                         "region": region,
                         "subject": int(ss),
                         "voxel_id": int(voxel_id),
                         "voxel_index_in_region": int(idx),
-                        "voxel_rank_in_topk": int(i + 1),
+                        "voxel_rank": int(voxel_rank),
+                        "voxel_rank_in_topk": int(voxel_rank),
                         "voxel_r2": float(topk_values[i]),
+                        "prf_idx": int(prf_idx),
+                        "prf_grid_name": prf_grid_name,
+                        "prf_x": float(prf_grid_params[int(prf_idx), 0]),
+                        "prf_y": float(prf_grid_params[int(prf_idx), 1]),
+                        "prf_sigma": float(prf_grid_params[int(prf_idx), 2]),
+                        "contrast_prf_layer": contrast_prf_layer,
+                        "contrast_prf_native_size": contrast_prf_native_size,
+                        "generation_status": (
+                            "complete"
+                            if len(image_records) >= args.num_seeds
+                            else "partial_max_attempts_reached"
+                        ),
+                        "requested_candidates": int(args.num_seeds),
+                        "accepted_candidates": int(len(image_records)),
+                        "candidate_shortfall": int(
+                            max(0, args.num_seeds - len(image_records))
+                        ),
+                        # Retained for compatibility with existing readers.
                         "num_candidates": int(len(image_records)),
                         "generation_attempts": int(len(attempted_seeds)),
                         "max_generation_attempts": int(max_generation_attempts),
+                        "max_generation_attempts_reached": bool(
+                            len(attempted_seeds) >= max_generation_attempts
+                        ),
                         "contrast_validation_tolerance_byte": float(
                             args.contrast_validation_tolerance
                         ),
+                        "contrast_constraint_timing": (
+                            args.contrast_constraint_timing
+                        ),
+                        "contrast_constraint_scope": (
+                            args.contrast_constraint_scope
+                        ),
+                        "contrast_acceptance_domain": "unquantized_float",
+                        "contrast_target_rms_byte": (
+                            float(args.target_rms_contrast)
+                            if args.target_rms_contrast is not None
+                            else None
+                        ),
+                        "dual_scope_settings": {
+                            "solver_max_nfev": int(
+                                args.dual_scope_solver_max_nfev
+                            ),
+                            "every_step_iterations": int(
+                                args.dual_scope_every_step_iterations
+                            ),
+                            "parameter_limit": float(
+                                args.dual_scope_parameter_limit
+                            ),
+                            "adjustment_envelope_power": float(
+                                args.dual_scope_envelope_power
+                            ),
+                            "prf_resize": "bilinear",
+                            "prf_weight_sum": 1.0,
+                        },
                         "rejected_candidates": rejected_candidates,
+                        "ranking_top_n_requested": int(requested_top_n),
+                        "ranking_top_n_returned": int(top_n),
+                        # Retained for compatibility with existing readers.
                         "ranking_top_n": int(top_n),
+                        "online_ranking_model": {
+                            "metadata_file": os.path.relpath(
+                                ranking_model_metadata_path, voxel_folder
+                            ),
+                            "parameters_file": os.path.relpath(
+                                ranking_model_parameters_path, voxel_folder
+                            ),
+                        },
                         "results": top_ranked,
                     },
                     f,
@@ -1450,6 +2055,21 @@ def main():
                     f"kept_top_n={top_n}, "
                     f"saved={ranking_file}"
                 )
+
+
+    if args.generation_timing_file is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(args.generation_timing_file)), exist_ok=True)
+        timing_payload = {
+            "generation_seconds": generation_timing["seconds"],
+            "generation_calls": generation_timing["calls"],
+            "seconds_per_generation": (
+                generation_timing["seconds"] / generation_timing["calls"]
+                if generation_timing["calls"] else None
+            ),
+        }
+        with open(args.generation_timing_file, "w") as timing_handle:
+            json.dump(timing_payload, timing_handle, indent=2)
+        print(f"Generation-only timing: {timing_payload}")
 
 
 
