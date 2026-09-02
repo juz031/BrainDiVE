@@ -42,3 +42,6 @@ hanfei_code/
 script/slurm_out/
 slurm-*.out
 slurm-*.err
+*.err
+*.out
+*.slurm

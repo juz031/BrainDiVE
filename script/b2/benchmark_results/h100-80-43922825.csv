@@ -1,0 +1,2 @@
+gpu_requested,gpu_detected,job_id,requested_images,generation_calls,num_steps,generation_seconds,seconds_per_generation,exit_status
+h100-80,NVIDIA H100 80GB HBM3,43922825,10,10,100,163.0825113998726,16.30825113998726,0

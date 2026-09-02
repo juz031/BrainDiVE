@@ -1,0 +1,2 @@
+gpu_requested,gpu_detected,job_id,requested_images,generation_calls,num_steps,generation_seconds,seconds_per_generation,exit_status
+l40s-48,NVIDIA L40S,43922824,10,10,100,219.5794061315246,21.95794061315246,0
