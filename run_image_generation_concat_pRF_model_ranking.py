@@ -16,6 +16,12 @@ import pandas as pd
 import torch
 from diffusers import DiffusionPipeline, DPMSolverMultistepScheduler, LMSDiscreteScheduler
 from brain_guide_pipeline import mypipelineSAG
+from generation_timing_utils import merge_roi_generation_timing
+from joint_luma_contrast_utils import validate_luminance_settings
+from luma_rgb_clip_utils import validate_luma_contrast_method, method_metadata
+from seed_utils import (build_seed_plan, save_seed_record, save_json_atomic,
+                        summarize_generation_times, GENERATION_TIMING_SCOPE,
+                        collect_device_metadata)
 from dual_scope_contrast_utils import (
     DualScopeContrastConvergenceError,
     global_luma_mean_and_rms,
@@ -32,9 +38,6 @@ import argparse
 from torchvision.models.feature_extraction import create_feature_extractor
 from prf_utils import get_prf_grid, get_prf_stack
 from voxel_selection import select_voxels_by_rank
-import random
-from base64 import b64encode
-random.seed(a=b64encode(os.urandom(5)).decode('utf-8'))
 from PIL import Image
 from torchvision import transforms
 from skimage.transform import resize
@@ -245,7 +248,7 @@ def load_nsd_rois(ss, args):
 
     big_mask = roi_info['voxel_mask']
     roi_keys = ['roi_labels_kastner', 'roi_labels_retino', 'roi_labels_face', 'roi_labels_place', 'roi_labels_body']
-    roi_names = ['kastner_atlas_roi_names', 'ret_prf_roi_names', 'floc_face_roi_names', 'floc_place_roi_names', 'floc_body_roi_names']
+    roi_names = ['kastner_atlas_roi_names', 'ret_prf_roi_names',  'floc_face_roi_names', 'floc_place_roi_names', 'floc_body_roi_names']
     roi_masks = dict()
     for key, name in zip(roi_keys, roi_names):
         roi_labels = roi_info[key][big_mask]
@@ -759,6 +762,112 @@ def rank_model_fitting(voxel_id, best_prf_idx, voxel_data, train_ids, val_ids, n
     )
 
 
+def build_image_save_metadata(mode, stages, ranking_enabled):
+    """Explain image provenance independently of the folder's legacy name."""
+    adjusted = any(stage != 'none' for stage in stages)
+    return {
+        'mode': mode,
+        'constraint_timings': dict(zip(
+            ('contrast_full_image', 'contrast_prf', 'luminance_full_image', 'luminance_prf'), stages)),
+        'pre_adjustment': {
+            'saving_enabled': mode != 'constrained_only' and adjusted,
+            'folder': 'unconstrained_images',
+            'capture_stage': 'final_decode_before_last_constraint_adjustment',
+            'guidance_already_used_constraints': 'every_step' in stages,
+            'meaning': 'Before the last adjustment, not a separate unconstrained generation.',
+        },
+        'post_adjustment': {
+            'saving_enabled': mode != 'unconstrained_only',
+            'folder': 'images',
+        },
+        'format': 'PNG', 'color_mode': 'RGB', 'bits_per_channel': 8,
+        'quantization': 'round(clip(float_pixels, 0, 1) * 255) to uint8',
+        'exact_float_decode_preserved': False,
+        'final_adjustment_configured': adjusted,
+        'final_adjustment_enabled': adjusted and mode != 'unconstrained_only',
+        'save_mode_skips_final_adjustment': mode == 'unconstrained_only',
+        'final_target_validation_applied': adjusted and mode != 'unconstrained_only',
+        'final_adjustment_rejected_seeds_saved': False,
+        'selection': 'ranking_model_top_n' if ranking_enabled else 'all_valid_candidates_in_seed_attempt_order',
+        'scores_computed_on': (
+            ('unadjusted_final_decode' if mode == 'unconstrained_only'
+             else 'pipeline_output_after_last_adjustment_if_enabled') if ranking_enabled else None),
+    }
+
+
+def generation_summary_for_mode(summary, ranking_enabled):
+    """Keep ranking metadata only when scoring/ranking actually ran."""
+    summary['ranking_enabled'] = ranking_enabled
+    if not ranking_enabled:
+        for key in ('ranking_definitions', 'candidate_rankings', 'ranking_top_n_requested',
+                    'ranking_top_n_returned', 'ranking_top_n', 'online_ranking_model'):
+            summary.pop(key, None)
+        summary['image_order'] = 'valid_seed_attempt_order'
+        summary['valid_seed_definition'] = 'passed_image_and_constraint_checks_without_post_generation_scoring'
+        summary['rejected_candidates'] = {
+            key: value for key, value in summary['rejected_candidates'].items()
+            if key not in ('nonfinite_gen_score', 'nonfinite_rank_score')
+        }
+    return summary
+
+
+def parse_ranking_top_n(value):
+    """Accept a positive saved-image count or the literal 'all'."""
+    if value == "all":
+        return "all"
+    try:
+        count = int(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("ranking_top_n must be a positive integer or 'all'") from error
+    if count < 1:
+        raise argparse.ArgumentTypeError("ranking_top_n must be positive or 'all'")
+    return count
+
+
+def resolve_luminance_targets(args):
+    """Fill omitted active targets with the subject's mean image luma (byte units)."""
+    sources = {}
+    missing = []
+    for scope in ('full_image', 'prf'):
+        enabled = getattr(args, f'luminance_constraint_{scope}') != 'none'
+        target = getattr(args, f'target_luminance_{scope}')
+        sources[scope] = 'explicit' if enabled and target is not None else None
+        if enabled and target is None:
+            missing.append(scope)
+    metadata = {'target_sources': sources, 'statistics_path': None}
+    if not missing:
+        return metadata
+
+    path = args.contrast_stats_json or os.path.join(
+        args.model_root, f'S{args.subject_id}', 'nsd_contrast_statistics.json')
+    try:
+        with open(path) as handle:
+            statistics = json.load(handle)
+        if 'subject' in statistics and statistics['subject'] != args.subject_id:
+            raise ValueError(
+                f"statistics subject {statistics['subject']} does not match "
+                f"requested subject {args.subject_id}")
+        mean = float(statistics['luminance_mean']['byte_0_255']['mean'])
+        if not np.isfinite(mean) or not 0 <= mean <= 255:
+            raise ValueError('mean luminance must be finite and in [0, 255]')
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise ValueError(
+            f"Cannot load mean luminance from {path}: {error}. "
+            "Run calculate_nsd_contrast_statistics.py for this subject, pass "
+            "--contrast_stats_json, or supply explicit luminance targets."
+        ) from error
+
+    for scope in missing:
+        setattr(args, f'target_luminance_{scope}', mean)
+        sources[scope] = 'luminance_mean.byte_0_255.mean'
+    metadata.update(statistics_path=os.path.abspath(path),
+                    statistics_subject=statistics.get('subject'),
+                    statistics_selection=statistics.get('selection'),
+                    statistics_image_count=statistics.get('image_count'),
+                    dataset_mean_luminance_byte=mean)
+    return metadata
+
+
 def main():
     ### PATHS ############################################################
     nsd_path = '/ocean/projects/soc250009p/shared/datasets/nsd_preproc'
@@ -773,6 +882,8 @@ def main():
     parser.add_argument('--roi_path', type=str, default=os.path.join(rois_folder, 'S{}_voxel_roi_info.npy'))
     parser.add_argument('--gen_model', type=str, default="DINO_RN50")
     parser.add_argument('--rank_model', type=str, default="OPEN_CLIP_RN50")
+    parser.add_argument('--enable_ranking', choices=['true', 'false'], default='true',
+                        help="Enable online ranking and post-generation scoring; false saves all pixel-valid candidates")
     parser.add_argument('--split_id', type=int, choices=[1, 2], default=1)
     parser.add_argument('--feature_root', type=str, default="/user_data/junruz/prf_features")
     parser.add_argument('--model_root', type=str, default="/user_data/junruz/prf_models/concat/split_1_zscore")
@@ -806,31 +917,38 @@ def main():
     )
     parser.add_argument(
         '--contrast_constraint_method',
-        choices=['none', 'max', 'range', 'match'],
+        choices=['max', 'range', 'match'],
         default='range',
         help=(
-            "Contrast projection to use: 'none' disables it, 'max' caps RMS "
-            "contrast, 'range' keeps it between lower/upper bounds, and "
-            "'match' projects every image to one target RMS contrast."
+            "Which whole-image projection to use: 'max' caps RMS contrast, "
+            "'range' keeps it between lower/upper bounds, and 'match' "
+            "projects every image to one target RMS contrast. Ignored when "
+            "--contrast_constraint_full_image is 'none'. The soft-pRF "
+            "constraint always matches an exact target."
         ),
     )
     parser.add_argument(
-        '--contrast_constraint_timing',
-        choices=['every_step', 'final'],
+        '--contrast_constraint_full_image',
+        choices=['none', 'every_step', 'final'],
         default='every_step',
         help=(
-            "Apply the selected contrast constraint before every "
-            "brain-guidance evaluation or only once after the final "
-            "diffusion step."
+            "When to constrain whole-image RMS contrast. 'every_step' "
+            "projects before every brain-guidance evaluation and again "
+            "after the last diffusion step, 'final' projects only after "
+            "the last step, and 'none' disables the constraint."
         ),
     )
     parser.add_argument(
-        '--contrast_constraint_scope',
-        choices=['full_image', 'full_image_and_prf'],
-        default='full_image',
+        '--contrast_constraint_prf',
+        choices=['none', 'every_step', 'final'],
+        default='none',
         help=(
-            "Constrain only full-image RMS contrast, or constrain both "
-            "full-image and soft-pRF-weighted RMS contrast to the same target."
+            "When to additionally match soft-pRF-weighted RMS contrast to "
+            "the same target, using the same stage names. It cannot run at "
+            "a stage where --contrast_constraint_full_image does not, "
+            "because the dual-scope solver drives both statistics to one "
+            "shared target, and it requires "
+            "--contrast_constraint_method match."
         ),
     )
     parser.add_argument(
@@ -840,7 +958,7 @@ def main():
         type=str,
         default=None,
         help=(
-            "NSD contrast-statistics JSON. Defaults to "
+            "NSD contrast and mean-luminance statistics JSON. Defaults to "
             "MODEL_ROOT/SUBJECT/nsd_contrast_statistics.json"
         ),
     )
@@ -876,11 +994,43 @@ def main():
         ),
     )
     parser.add_argument('--num_seeds', type=int, default=3)
-    parser.add_argument('--ranking_top_n', type=int, default=5)
+    parser.add_argument('--seed_mode', choices=['random', 'file', 'fixed'], default='random',
+                        help="Fresh random sequence, JSON seed file, or fixed-generator sequence")
+    parser.add_argument('--seed_file', type=str, default=None,
+                        help="JSON list or saved seeds.json; required for seed_mode=file")
+    parser.add_argument('--seed_file_key', choices=['all_seeds_attempted', 'valid_seeds', 'seed_set'],
+                        default='all_seeds_attempted', help="List to load from a JSON object")
+    parser.add_argument('--seed_generator_seed', type=int, default=None,
+                        help="Seed for generating the image-seed sequence in fixed mode")
+    parser.add_argument('--ranking_top_n', type=parse_ranking_top_n, default=5,
+                        help="Save the top N accepted images, or 'all' to save every accepted image")
+    parser.add_argument('--image_save_mode',
+                        choices=['unconstrained_only', 'constrained_only', 'both'], default='both',
+                        help="PNG versions to save; unconstrained_only skips the last adjustment and its target checks")
+    parser.add_argument('--luminance_constraint_full_image',
+                        choices=['none', 'every_step', 'final'], default='none')
+    parser.add_argument('--luminance_constraint_prf',
+                        choices=['none', 'every_step', 'final'], default='none')
+    parser.add_argument('--target_luminance_full_image', type=float, default=None,
+                        help="Override whole-image mean luma (0-255); defaults to the NSD dataset mean")
+    parser.add_argument('--target_luminance_prf', type=float, default=None,
+                        help="Override soft-pRF mean luma (0-255); defaults to the same NSD dataset mean")
+    parser.add_argument('--luminance_validation_tolerance', type=float, default=0.01,
+                        help=("Allowed mean-luma error in 0-255 units: pre-RGB-clipping "
+                              "luma for luma_rgb_clip, clipped RGB for joint_solver"))
+    parser.add_argument('--luma_contrast_method', choices=['luma_rgb_clip', 'joint_solver'],
+                        default='luma_rgb_clip', help=(
+                            "luma_rgb_clip: match luma then restore original chroma and clip RGB; "
+                            "requires paired mean/RMS timings per scope and method=match. "
+                            "joint_solver retains strict post-RGB-clipping matching."))
+    parser.add_argument('--luma_rgb_clip_match_iterations', type=int, default=20,
+                        help="Full-only luma loop: at most N+1 passes, matching the reference")
+    parser.add_argument('--luminance_shift_limit', type=float, default=1.0,
+                        help="Bound on local/global brightness shifts in normalized [0,1] units")
     parser.add_argument(
         '--generation_timing_file', type=str, default=None,
-        help=("Optional JSON output for time spent only inside diffusion "
-              "pipeline calls; CUDA is synchronized around every call."),
+        help=("Optional timing JSON mirror; written under a roi-<name> subfolder "
+              "of the supplied parent directory. CUDA synchronized around every pipeline call."),
     )
     parser.add_argument(
         '--max_generation_attempts',
@@ -897,7 +1047,8 @@ def main():
         default=0.01,
         help=(
             "Allowed unquantized-float RMS-contrast error in 0-255 pixel "
-            "units. The reference dual-scope experiment uses 0.01."
+            "units. luma_rgb_clip checks projected luma before RGB clipping; "
+            "joint_solver checks clipped RGB. The reference tolerance is 0.01."
         ),
     )
     parser.add_argument('--dual_scope_solver_max_nfev', type=int, default=300)
@@ -909,6 +1060,74 @@ def main():
     parser.add_argument('--save_root', type=str, default="/user_data/junruz/BrainDiVE/pRF_concat_model_ranked")
     args = parser.parse_args()
 
+    try:
+        validate_luma_contrast_method(
+            args.luma_contrast_method, args.contrast_constraint_full_image,
+            args.contrast_constraint_prf, args.luminance_constraint_full_image,
+            args.luminance_constraint_prf, args.contrast_constraint_method,
+            args.luma_rgb_clip_match_iterations,
+        )
+        luminance_target_metadata = resolve_luminance_targets(args)
+    except ValueError as error:
+        parser.error(str(error))
+
+    luminance_options = dict(
+        apply_final_adjustment=args.image_save_mode != 'unconstrained_only',
+        luma_contrast_method=args.luma_contrast_method,
+        luma_rgb_clip_match_iterations=args.luma_rgb_clip_match_iterations,
+        luminance_constraint_full_image=args.luminance_constraint_full_image,
+        luminance_constraint_prf=args.luminance_constraint_prf,
+        target_luminance_full_image=(args.target_luminance_full_image / 255
+                                    if args.target_luminance_full_image is not None else None),
+        target_luminance_prf=(args.target_luminance_prf / 255
+                             if args.target_luminance_prf is not None else None),
+        luminance_validation_tolerance=args.luminance_validation_tolerance / 255,
+        luminance_shift_limit=args.luminance_shift_limit,
+    )
+    try:
+        validate_luminance_settings(
+            args.luminance_constraint_full_image, args.luminance_constraint_prf,
+            luminance_options['target_luminance_full_image'],
+            luminance_options['target_luminance_prf'],
+            luminance_options['luminance_validation_tolerance'],
+            args.contrast_constraint_full_image, args.contrast_constraint_method,
+            args.luminance_shift_limit,
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    stage_order = {'none': 0, 'final': 1, 'every_step': 2}
+    constraint_method_metadata = method_metadata(
+        args.luma_contrast_method,
+        max((args.contrast_constraint_full_image, args.luminance_constraint_full_image), key=stage_order.get),
+        max((args.contrast_constraint_prf, args.luminance_constraint_prf), key=stage_order.get),
+        args.luma_rgb_clip_match_iterations,
+    )
+    acceptance_domain = constraint_method_metadata['acceptance_domain']
+    if args.image_save_mode == 'unconstrained_only':
+        constraint_method_metadata['configured_final_solver'] = constraint_method_metadata['effective_solver']['final']
+        constraint_method_metadata['effective_solver']['final'] = 'skipped_unconstrained_only'
+        acceptance_domain = 'unadjusted_decode_pixel_validity_only'
+    print(f"Luma/contrast method: {constraint_method_metadata}")
+    luminance_metadata = {
+        **luminance_target_metadata,
+        'quantity': 'gamma_coded_Rec709_mean_luma',
+        'full_image': args.luminance_constraint_full_image,
+        'prf': args.luminance_constraint_prf,
+        'target_full_image_byte': (args.target_luminance_full_image
+                                   if args.luminance_constraint_full_image != 'none' else None),
+        'target_prf_byte': (args.target_luminance_prf
+                            if args.luminance_constraint_prf != 'none' else None),
+        'acceptance_domain': acceptance_domain,
+        'final_target_validation_applied': args.image_save_mode != 'unconstrained_only',
+        'projection_method': constraint_method_metadata,
+        'acceptance_tolerance_byte': args.luminance_validation_tolerance,
+        'shift_limit_normalized': args.luminance_shift_limit,
+        'joint_solver_tolerance': 1e-8,
+        'joint_solver_max_nfev': args.dual_scope_solver_max_nfev,
+        'joint_every_step_iterations': args.dual_scope_every_step_iterations,
+        'prf_source': 'highest_resolution_generation_layer',
+    }
+
     ss = args.subject_id
     if args.num_seeds < 1:
         parser.error("--num_seeds must be at least 1")
@@ -919,12 +1138,24 @@ def main():
         parser.error("--max_generation_attempts cannot be less than --num_seeds")
     if args.contrast_validation_tolerance <= 0:
         parser.error("--contrast_validation_tolerance must be positive")
+    contrast_stage_rank = {'none': 0, 'final': 1, 'every_step': 2}
     if (
-        args.contrast_constraint_scope == 'full_image_and_prf'
+        contrast_stage_rank[args.contrast_constraint_prf]
+        > contrast_stage_rank[args.contrast_constraint_full_image]
+    ):
+        parser.error(
+            "--contrast_constraint_prf cannot run at a stage where "
+            "--contrast_constraint_full_image does not, because the "
+            "dual-scope solver drives whole-image and soft-pRF contrast to "
+            f"the same target; got prf={args.contrast_constraint_prf} with "
+            f"full_image={args.contrast_constraint_full_image}"
+        )
+    if (
+        args.contrast_constraint_prf != 'none'
         and args.contrast_constraint_method != 'match'
     ):
         parser.error(
-            "--contrast_constraint_scope full_image_and_prf requires "
+            "--contrast_constraint_prf requires "
             "--contrast_constraint_method match"
         )
     if args.dual_scope_solver_max_nfev <= 0:
@@ -937,8 +1168,16 @@ def main():
         parser.error("--dual_scope_envelope_power must be positive")
 
     contrast_stats_path = None
+    try:
+        seed_plan = build_seed_plan(
+            args.seed_mode, args.num_seeds, args.max_generation_attempts,
+            args.seed_file, args.seed_generator_seed, args.seed_file_key)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        parser.error(f"Invalid seed configuration: {error}")
+    print(f"Seed mode: {seed_plan['mode']}; plan: {seed_plan['plan_id']}; "
+          f"attempt budget per voxel: {seed_plan['effective_max_attempts']}")
     percentile_values = None
-    needs_contrast_statistics = (
+    needs_contrast_statistics = args.contrast_constraint_full_image != 'none' and (
         (args.contrast_constraint_method == 'max' and args.max_rms_contrast is None)
         or (
             args.contrast_constraint_method == 'range'
@@ -984,7 +1223,12 @@ def main():
             f"available percentiles: {list(percentile_values)}"
         )
 
-    if args.contrast_constraint_method == 'max':
+    if args.contrast_constraint_full_image == 'none':
+        args.min_rms_contrast = None
+        args.max_rms_contrast = None
+        args.target_rms_contrast = None
+        contrast_description = "disabled"
+    elif args.contrast_constraint_method == 'max':
         if args.max_rms_contrast is None:
             args.max_rms_contrast = get_contrast_percentile(
                 args.max_contrast_percentile
@@ -1024,19 +1268,36 @@ def main():
         args.min_rms_contrast = None
         args.max_rms_contrast = None
         contrast_description = f"target {args.target_rms_contrast:.6g}"
+
+    constraint_stages = (
+        args.contrast_constraint_full_image, args.contrast_constraint_prf,
+        args.luminance_constraint_full_image, args.luminance_constraint_prf,
+    )
+    image_saving_metadata = build_image_save_metadata(
+        args.image_save_mode, constraint_stages, args.enable_ranking == 'true')
+    if args.image_save_mode == 'unconstrained_only' and all(stage == 'none' for stage in constraint_stages):
+        parser.error("--image_save_mode unconstrained_only requires an enabled constraint (every_step or final)")
+    save_constrained_images = args.image_save_mode != 'unconstrained_only'
+    save_unconstrained_images = (
+        args.image_save_mode != 'constrained_only' and any(stage != 'none' for stage in constraint_stages)
+    )
+    if not save_unconstrained_images:
+        unconstrained_image_content = None
+    elif 'every_step' in constraint_stages:
+        unconstrained_image_content = "pre_final_projection_decode_with_constrained_guidance"
     else:
-        args.min_rms_contrast = None
-        args.max_rms_contrast = None
-        args.target_rms_contrast = None
-        contrast_description = "disabled"
+        unconstrained_image_content = "raw_decode"
 
     print(
         f"Using Rec.709 RMS contrast method "
         f"{args.contrast_constraint_method!r}: {contrast_description} "
-        f"in 0-255 pixel units; timing={args.contrast_constraint_timing!r}; "
-        f"scope={args.contrast_constraint_scope!r}; float tolerance="
-        f"{args.contrast_validation_tolerance:g} byte"
+        f"in 0-255 pixel units; "
+        f"full_image={args.contrast_constraint_full_image!r}; "
+        f"prf={args.contrast_constraint_prf!r}; float tolerance="
+        f"{args.contrast_validation_tolerance:g} byte; "
+        f"unconstrained images saved={save_unconstrained_images}"
     )
+    print(f"Luminance settings: {luminance_metadata}; keep={args.ranking_top_n}")
 
     def path_component(value):
         """Return a readable, filesystem-safe output path component."""
@@ -1047,16 +1308,23 @@ def main():
         return cleaned.strip("-.") or "unnamed"
 
     gen_layer_sizes = getattr(LayerSize, f"{args.gen_model}_layer_size")
-    rank_layer_sizes = getattr(LayerSize, f"{args.rank_model}_layer_size")
+    if args.enable_ranking == 'false':
+        print("Ranking disabled: ignoring --ranking_top_n; saving all pixel-valid candidates in seed-attempt order.")
+    rank_layer_sizes = (getattr(LayerSize, f"{args.rank_model}_layer_size")
+                        if args.enable_ranking == 'true' else None)
     n_pix_img = 224
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    hardware_metadata = collect_device_metadata(device, torch)
+    print(f"Generation hardware: {hardware_metadata}")
 
     ###### BRAIN ENCODER ###################################################
     print("Building brain encoder")
     brain_encoder = build_brain_encoder(args.gen_model, device)
-    print("Building rank encoder")
-    rank_encoder = build_brain_encoder(args.rank_model, device)
+    rank_encoder = None
+    if args.enable_ranking == 'true':
+        print("Building rank encoder")
+        rank_encoder = build_brain_encoder(args.rank_model, device)
 
 
     def preprocess_encoder_input(image_tensor, model_name):
@@ -1143,28 +1411,31 @@ def main():
         )
     validate_concat_layout(gen_metadata, gen_layer_sizes, "Generation")
 
-    rank_model_path = os.path.join(
-        args.model_root,
-        f"S{args.subject_id}",
-        f"{args.rank_model}_set{args.split_id}",
-    )
-    rank_metadata = load_concat_metadata(rank_model_path, args.rank_model)
-    rank_layer_names = rank_metadata["layers"]
-    unknown_rank_layers = set(rank_layer_names) - set(rank_layer_sizes)
-    if unknown_rank_layers:
-        parser.error(
-            f"Unknown ranking layers in concat metadata: "
-            f"{sorted(unknown_rank_layers)}"
+    rank_layer_names = []
+    if args.enable_ranking == 'true':
+        rank_model_path = os.path.join(
+            args.model_root,
+            f"S{args.subject_id}",
+            f"{args.rank_model}_set{args.split_id}",
         )
-    validate_concat_layout(rank_metadata, rank_layer_sizes, "Ranking")
+        rank_metadata = load_concat_metadata(rank_model_path, args.rank_model)
+        rank_layer_names = rank_metadata["layers"]
+        unknown_rank_layers = set(rank_layer_names) - set(rank_layer_sizes)
+        if unknown_rank_layers:
+            parser.error(
+                f"Unknown ranking layers in concat metadata: "
+                f"{sorted(unknown_rank_layers)}"
+            )
+        validate_concat_layout(rank_metadata, rank_layer_sizes, "Ranking")
     print(
         f"Generation concatenation: {args.gen_model} layers "
         f"{gen_layer_names} ({gen_metadata['num_features']} features)"
     )
-    print(
-        f"Ranking concatenation: {args.rank_model} layers "
-        f"{rank_layer_names} ({rank_metadata['num_features']} features)"
-    )
+    if args.enable_ranking == 'true':
+        print(
+            f"Ranking concatenation: {args.rank_model} layers "
+            f"{rank_layer_names} ({rank_metadata['num_features']} features)"
+        )
 
 
     ####################### Turn on if zscore is used #######################
@@ -1188,13 +1459,14 @@ def main():
         )
     # Load rois masks
     roi_masks, noise_ceiling = load_nsd_rois(ss, args)
-    split_dir = os.path.join(args.model_root, f'S{ss}')
-    data_splits_path = os.path.join(split_dir, f'data_splits_S{ss}.pkl')
-    with open(data_splits_path, 'rb') as f:
-        data_splits = pickle.load(f)
-    ids = data_splits[args.split_id]
-    train_ids, val_ids, nest_ids = ids['train'], ids['val'], ids['nest']
-    voxel_data, good_values = load_nsd_data(data_folder, labels_folder, ss)
+    if args.enable_ranking == 'true':
+        split_dir = os.path.join(args.model_root, f'S{ss}')
+        data_splits_path = os.path.join(split_dir, f'data_splits_S{ss}.pkl')
+        with open(data_splits_path, 'rb') as f:
+            data_splits = pickle.load(f)
+        ids = data_splits[args.split_id]
+        train_ids, val_ids, nest_ids = ids['train'], ids['val'], ids['nest']
+        voxel_data, good_values = load_nsd_data(data_folder, labels_folder, ss)
 
 
     ########################## Stable Diffusion Pipeline #########################################
@@ -1218,7 +1490,7 @@ def main():
     # random.seed(a=b64encode(os.urandom(5)).decode('utf-8'))
     # random.shuffle(regions)
 
-    generation_timing = {"seconds": 0.0, "calls": 0}
+    generation_timing = {"seconds": 0.0, "calls": 0, "voxels": {}}
     prf_grid_params, prf_grid_name = get_prf_grid("default-log-polar")
     for region in regions:
         print("Starting S{} {}".format(ss, region))
@@ -1299,7 +1571,7 @@ def main():
                     f"Selected pRF ID {prf_idx} for voxel {voxel_id} is not "
                     "listed in the generation checkpoint metadata"
                 )
-            if int(prf_idx) not in set(rank_metadata["prf_ids"]):
+            if args.enable_ranking == 'true' and int(prf_idx) not in set(rank_metadata["prf_ids"]):
                 raise ValueError(
                     f"Generation-selected pRF ID {prf_idx} is unavailable in "
                     "the ranking model metadata"
@@ -1376,35 +1648,48 @@ def main():
             sag_scale = args.sag_scale
             model_folder = (
                 f"gen-{path_component(args.gen_model)}-concat"
-                f"__rank-{path_component(args.rank_model)}-concat"
+                + (f"__rank-{path_component(args.rank_model)}-concat" if args.enable_ranking == 'true' else "")
             )
-            if args.contrast_constraint_method == 'max':
+            if args.contrast_constraint_full_image == 'none':
+                contrast_folder = "none"
+            elif args.contrast_constraint_method == 'max':
                 contrast_folder = f"max-rms{args.max_rms_contrast:.2f}"
             elif args.contrast_constraint_method == 'range':
                 contrast_folder = (
                     f"range-rms{args.min_rms_contrast:.2f}"
                     f"-{args.max_rms_contrast:.2f}"
                 )
-            elif args.contrast_constraint_method == 'match':
-                contrast_folder = f"match-rms{args.target_rms_contrast:.2f}"
             else:
-                contrast_folder = "none"
+                contrast_folder = f"match-rms{args.target_rms_contrast:.2f}"
+            luma_full = args.luminance_constraint_full_image
+            luma_prf = args.luminance_constraint_prf
+            if luma_full != "none":
+                luma_full += f"-{args.target_luminance_full_image:g}"
+            if luma_prf != "none":
+                luma_prf += f"-{args.target_luminance_prf:g}"
             settings_folder = (
                 f"split-{args.split_id:02d}"
                 f"__steps-{num_steps}"
                 f"__scale-{brain_guidance_scale:g}"
                 f"__sag-{sag_scale:g}"
                 f"__contrast-{contrast_folder}"
-                f"__scope-{args.contrast_constraint_scope}"
-                f"__contrast-timing-{args.contrast_constraint_timing}"
+                f"__full-{args.contrast_constraint_full_image}"
+                f"__prf-{args.contrast_constraint_prf}"
+                f"__luma-full-{luma_full}__luma-prf-{luma_prf}"
                 f"__seeds-{args.num_seeds}"
-                f"__keep-{args.ranking_top_n}"
+                f"__keep-{args.ranking_top_n if args.enable_ranking == 'true' else 'all'}"
             )
+            # Method-specific branch also separates old, unlabelled experiment paths.
+            # Keep the already-long settings component below filesystem name limits.
+            settings_folder = os.path.join(
+                'ranking-enabled' if args.enable_ranking == 'true' else 'ranking-disabled',
+                f"method-{args.luma_contrast_method}", settings_folder)
             experiment_folder = os.path.join(
                 args.save_root,
                 f"sub-{args.subject_id:02d}",
                 model_folder,
                 settings_folder,
+                f"seed-{args.seed_mode}-{seed_plan['plan_id']}",
             )
             region_folder = os.path.join(
                 experiment_folder,
@@ -1414,15 +1699,27 @@ def main():
                 region_folder,
                 f"voxel-rank-{voxel_rank:02d}__id-{voxel_id:06d}",
             )
-            images_folder = os.path.join(voxel_folder, "images")
-            os.makedirs(images_folder, exist_ok=True)
+            images_folder = os.path.join(voxel_folder, "images") if save_constrained_images else None
+            if images_folder is not None:
+                os.makedirs(images_folder, exist_ok=True)
 
-            config_file = os.path.join(experiment_folder, "run_config.json")
+            # Pre-projection decodes sit beside "images" in the voxel folder.
+            unconstrained_images_folder = None
+            if save_unconstrained_images:
+                unconstrained_images_folder = os.path.join(
+                    voxel_folder, "unconstrained_images"
+                )
+                os.makedirs(unconstrained_images_folder, exist_ok=True)
+
+            config_file = os.path.join(region_folder, "run_config.json")
             if not os.path.exists(config_file):
                 with open(config_file, "w") as config_handle:
                     json.dump(
                         {
                             "subject": int(args.subject_id),
+                            "ranking_enabled": args.enable_ranking == 'true',
+                            "image_saving": image_saving_metadata,
+                            "seed_plan": seed_plan,
                             "split": int(args.split_id),
                             "generation_model": {
                                 "name": args.gen_model,
@@ -1433,7 +1730,7 @@ def main():
                                 "name": args.rank_model,
                                 "layers": list(rank_layer_names),
                                 "concatenated": True,
-                            },
+                            } if args.enable_ranking == 'true' else None,
                             "generation": {
                                 "num_steps": int(num_steps),
                                 "brain_guidance_scale": float(brain_guidance_scale),
@@ -1443,7 +1740,7 @@ def main():
                                 "voxel_rank_start": int(voxel_ranks[0]),
                                 "voxel_rank_end": int(voxel_ranks[-1]),
                                 "voxel_count": int(len(voxel_ranks)),
-                                "ranking_top_n": int(args.ranking_top_n),
+                                "ranking_top_n": args.ranking_top_n if args.enable_ranking == 'true' else None,
                                 "max_generation_attempts": (
                                     int(args.max_generation_attempts)
                                     if args.max_generation_attempts is not None
@@ -1453,13 +1750,25 @@ def main():
                                     args.contrast_validation_tolerance
                                 ),
                             },
+                            "luminance": luminance_metadata,
+                            "constraint_projection": constraint_method_metadata,
                             "contrast": {
                                 "method": args.contrast_constraint_method,
-                                "timing": args.contrast_constraint_timing,
-                                "scope": args.contrast_constraint_scope,
-                                "acceptance_domain": "unquantized_float",
+                                "full_image": (
+                                    args.contrast_constraint_full_image
+                                ),
+                                "prf": args.contrast_constraint_prf,
+                                "acceptance_domain": acceptance_domain,
                                 "acceptance_tolerance_byte": float(
                                     args.contrast_validation_tolerance
+                                ),
+                                "image_save_mode": args.image_save_mode,
+                                "constrained_image_saved": save_constrained_images,
+                                "unconstrained_image_saved": bool(
+                                    save_unconstrained_images
+                                ),
+                                "unconstrained_image_content": (
+                                    unconstrained_image_content
                                 ),
                                 "statistics_json": (
                                     os.path.abspath(contrast_stats_path)
@@ -1516,7 +1825,9 @@ def main():
                                     ),
                                 },
                             },
-                            "regions": list(args.roi),
+                            "region": region,
+                            "regions": [region],
+                            "invocation_regions": list(args.roi),
                         },
                         config_handle,
                         indent=2,
@@ -1525,7 +1836,31 @@ def main():
             pipe.brain_tweak = single_voxel_objective
 
             image_records = []
-            attempted_seeds = set()
+            attempted_seeds = []
+            seed_generation_times = []
+            seed_record_path = os.path.join(voxel_folder, 'seeds.json')
+
+            def checkpoint_seeds(status='in_progress'):
+                save_seed_record(seed_record_path, seed_plan, attempted_seeds,
+                                 [item['seed'] for item in image_records], status,
+                                 generation_times=seed_generation_times,
+                                 ranking_enabled=args.enable_ranking == 'true')
+                voxel_timing = {
+                    'subject': int(ss), 'region': region, 'voxel_id': int(voxel_id),
+                    'seed_record': os.path.abspath(seed_record_path), 'status': status,
+                    'hardware': hardware_metadata,
+                    **summarize_generation_times(seed_generation_times),
+                }
+                generation_timing['voxels'][os.path.abspath(seed_record_path)] = voxel_timing
+                merge_roi_generation_timing(
+                    os.path.join(region_folder, 'generation_timing.json'), region, [voxel_timing])
+                if args.generation_timing_file is not None:
+                    mirror_path = os.path.join(
+                        os.path.dirname(os.path.abspath(args.generation_timing_file)),
+                        os.path.basename(region_folder), os.path.basename(args.generation_timing_file))
+                    merge_roi_generation_timing(mirror_path, region, [voxel_timing])
+
+            checkpoint_seeds()
             rejected_candidates = {
                 "nonfinite_pixels": 0,
                 "invalid_shape": 0,
@@ -1538,12 +1873,13 @@ def main():
                 "nonfinite_dual_scope_parameters": 0,
                 "nonfinite_gen_score": 0,
                 "nonfinite_rank_score": 0,
+                "global_luminance_mismatch": 0,
+                "prf_luminance_mismatch": 0,
+                "joint_solver_failure": 0,
+                "nonfinite_joint_parameters": 0,
+                "luma_rgb_clip_solver_failure": 0,
             }
-            max_generation_attempts = args.max_generation_attempts
-            if max_generation_attempts is None:
-                max_generation_attempts = (
-                    args.num_seeds + max(10, int(np.ceil(args.num_seeds * 0.10)))
-                )
+            max_generation_attempts = seed_plan['effective_max_attempts']
             contrast_tolerance = args.contrast_validation_tolerance / 255.0
 
             def candidate_rejection_reason(image_array):
@@ -1557,18 +1893,22 @@ def main():
                 float_tensor = torch.from_numpy(
                     np.ascontiguousarray(image_array)
                 ).permute(2, 0, 1)[None].to(dtype=torch.float64)
-                _, global_rms = global_luma_mean_and_rms(float_tensor)
+                global_mean, global_rms = global_luma_mean_and_rms(float_tensor)
+                global_mean = float(global_mean[0])
                 global_rms = float(global_rms[0])
                 prf_rms = None
                 validation_weight = None
-                if args.contrast_constraint_scope == "full_image_and_prf":
+                prf_mean = None
+                if (args.contrast_constraint_prf != "none"
+                        or args.luminance_constraint_prf != "none"):
                     validation_weight = normalized_prf_weight(
                         contrast_prf_weight.detach().cpu(), float_tensor
                     )
-                    _, prf_value = weighted_luma_mean_and_rms(
+                    prf_mean_value, prf_value = weighted_luma_mean_and_rms(
                         float_tensor, validation_weight
                     )
                     prf_rms = float(prf_value[0])
+                    prf_mean = float(prf_mean_value[0])
 
                 quantized_array = (
                     np.rint(np.clip(image_array, 0, 1) * 255.0) / 255.0
@@ -1576,18 +1916,25 @@ def main():
                 quantized_tensor = torch.from_numpy(
                     np.ascontiguousarray(quantized_array)
                 ).permute(2, 0, 1)[None].to(dtype=torch.float64)
-                _, quantized_global = global_luma_mean_and_rms(
+                quantized_mean, quantized_global = global_luma_mean_and_rms(
                     quantized_tensor
                 )
                 quantized_global = float(quantized_global[0])
                 quantized_prf = None
+                quantized_prf_mean = None
                 if validation_weight is not None:
-                    _, quantized_prf_value = weighted_luma_mean_and_rms(
+                    quantized_prf_mean_value, quantized_prf_value = weighted_luma_mean_and_rms(
                         quantized_tensor, validation_weight
                     )
                     quantized_prf = float(quantized_prf_value[0])
+                    quantized_prf_mean = float(quantized_prf_mean_value[0])
 
                 metrics = {
+                    "float_global_mean_byte": global_mean * 255,
+                    "float_prf_mean_byte": prf_mean * 255 if prf_mean is not None else None,
+                    "png_global_mean_byte": float(quantized_mean[0]) * 255,
+                    "png_prf_mean_byte": (quantized_prf_mean * 255
+                                          if quantized_prf_mean is not None else None),
                     "float_global_rms_byte": global_rms * 255.0,
                     "float_prf_rms_byte": (
                         prf_rms * 255.0 if prf_rms is not None else None
@@ -1599,22 +1946,52 @@ def main():
                         else None
                     ),
                 }
+                if args.image_save_mode == 'unconstrained_only':
+                    # The final projection was deliberately skipped. Measure
+                    # targets for reporting only; do not reject their mismatch.
+                    metrics['acceptance_domain'] = 'unadjusted_decode_pixel_validity_only'
+                    metrics['final_target_validation_applied'] = False
+                    return None, metrics
+                if (args.luma_contrast_method == 'luma_rgb_clip'
+                        and args.contrast_constraint_full_image != 'none'):
+                    # The projector already enforced all active pre-RGB luma targets.
+                    # Final clipped RGB measurements are diagnostics, not acceptance
+                    # criteria for this method. Shape/range/finite checks still apply.
+                    metrics['acceptance_domain'] = acceptance_domain
+                    metrics['postclip_mismatch_policy'] = 'record_only'
+                    return None, metrics
                 if (
                     not np.isfinite(global_rms)
-                    or global_rms <= 1e-8
+                    or (global_rms <= 1e-8 and (
+                        args.contrast_constraint_full_image != "none"
+                        or args.luminance_constraint_full_image == "none"
+                    ))
                     or (
-                        prf_rms is not None
+                        args.contrast_constraint_prf != "none"
                         and (not np.isfinite(prf_rms) or prf_rms <= 1e-8)
                     )
                 ):
                     return "degenerate_contrast", metrics
 
-                if args.contrast_constraint_method == "match":
+                for scope, stage, measured, target in (
+                    ("global", args.luminance_constraint_full_image, global_mean,
+                     luminance_options['target_luminance_full_image']),
+                    ("prf", args.luminance_constraint_prf, prf_mean,
+                     luminance_options['target_luminance_prf']),
+                ):
+                    if stage != "none":
+                        error_byte = abs(measured - target) * 255
+                        metrics[f"{scope}_mean_error_byte"] = error_byte
+                        if error_byte > args.luminance_validation_tolerance:
+                            return f"{scope}_luminance_mismatch", metrics
+                if args.contrast_constraint_full_image == "none":
+                    valid_contrast = True
+                elif args.contrast_constraint_method == "match":
                     target = args.target_rms_contrast / 255.0
                     if abs(global_rms - target) > contrast_tolerance:
                         return "global_contrast_mismatch", metrics
                     if (
-                        prf_rms is not None
+                        args.contrast_constraint_prf != "none"
                         and abs(prf_rms - target) > contrast_tolerance
                     ):
                         return "prf_contrast_mismatch", metrics
@@ -1639,17 +2016,35 @@ def main():
                     return "contrast_mismatch", metrics
                 return None, metrics
 
+            def unconstrained_candidate_image(raw_image):
+                """Return the pre-projection decode and its global RMS.
+
+                The pipeline records one before the last adjustment whenever
+                any mean/RMS constraint is enabled (every_step or final).
+                This decode can come from an already constrained trajectory.
+                """
+                if not save_unconstrained_images or raw_image is None:
+                    return None, None
+                raw_tensor = torch.from_numpy(
+                    np.ascontiguousarray(
+                        np.asarray(raw_image[0], dtype=np.float32)
+                    )
+                ).permute(2, 0, 1)
+                _, raw_rms = global_luma_mean_and_rms(
+                    raw_tensor[None].to(dtype=torch.float64)
+                )
+                return raw_tensor, float(raw_rms[0]) * 255.0
+
             def generate_pixel_valid_candidates(number_needed):
                 generated = []
                 while (
                     len(generated) < number_needed
                     and len(attempted_seeds) < max_generation_attempts
                 ):
-                    seed = random.randint(0, 2**32 - 1)
-                    while seed in attempted_seeds:
-                        seed = random.randint(0, 2**32 - 1)
+                    seed = seed_plan['seed_set'][len(attempted_seeds)]
                     attempt_number = len(attempted_seeds) + 1
-                    attempted_seeds.add(seed)
+                    attempted_seeds.append(seed)
+                    checkpoint_seeds()
                     print(
                         f"Starting {attempt_number:05d} "
                         f"(accepted {len(image_records) + len(generated)}/"
@@ -1659,6 +2054,7 @@ def main():
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
                     generation_start = time.perf_counter()
+                    pipeline_returned = False
                     try:
                         try:
                             image = pipe(
@@ -1671,11 +2067,11 @@ def main():
                                 contrast_constraint_method=(
                                     args.contrast_constraint_method
                                 ),
-                                contrast_constraint_timing=(
-                                    args.contrast_constraint_timing
+                                contrast_constraint_full_image=(
+                                    args.contrast_constraint_full_image
                                 ),
-                                contrast_constraint_scope=(
-                                    args.contrast_constraint_scope
+                                contrast_constraint_prf=(
+                                    args.contrast_constraint_prf
                                 ),
                                 contrast_prf_weight=contrast_prf_weight,
                                 min_rms_contrast=(
@@ -1707,14 +2103,21 @@ def main():
                                     args.dual_scope_envelope_power
                                 ),
                                 output_type="np",
+                                **luminance_options,
                             )
+                            pipeline_returned = True
                         finally:
                             if device.type == "cuda":
                                 torch.cuda.synchronize(device)
-                            generation_timing["seconds"] += (
-                                time.perf_counter() - generation_start
-                            )
+                            elapsed = time.perf_counter() - generation_start
+                            generation_timing["seconds"] += elapsed
                             generation_timing["calls"] += 1
+                            seed_generation_times.append({
+                                'seed': int(seed), 'attempt_number': attempt_number,
+                                'generation_seconds': elapsed,
+                                'pipeline_returned': pipeline_returned,
+                            })
+                            checkpoint_seeds()
                     except DualScopeContrastConvergenceError as error:
                         rejected_candidates[error.reason] += 1
                         print(
@@ -1722,6 +2125,11 @@ def main():
                         )
                         continue
                     image_array = np.asarray(image.images[0], dtype=np.float32)
+                    raw_tensor, raw_rms_contrast_byte = (
+                        unconstrained_candidate_image(
+                            pipe.last_unconstrained_image
+                        )
+                    )
                     reason, contrast_metrics = candidate_rejection_reason(
                         image_array
                     )
@@ -1743,6 +2151,8 @@ def main():
                         "tensor": torch.from_numpy(
                             np.ascontiguousarray(image_array)
                         ).permute(2, 0, 1),
+                        "raw_tensor": raw_tensor,
+                        "raw_rms_contrast_byte": raw_rms_contrast_byte,
                         "rms_contrast_byte": contrast_metrics[
                             "float_global_rms_byte"
                         ],
@@ -1752,6 +2162,12 @@ def main():
                             if pipe.last_contrast_diagnostics is not None
                             else None
                         ),
+                        "joint_luma_rms_solver": pipe.last_joint_diagnostics,
+                        "luma_rgb_clip_diagnostics": (
+                            pipe.last_joint_diagnostics
+                            if args.luma_contrast_method == 'luma_rgb_clip' else None),
+                        "guidance_constraint_diagnostics": dict(
+                            pipe.last_guidance_constraint_diagnostics),
                     })
                 return generated
 
@@ -1759,7 +2175,7 @@ def main():
             if len(pending_records) < args.num_seeds:
                 print(
                     "Generation attempt limit reached before collecting the "
-                    "requested number of pixel-valid candidates; ranking the "
+                    "requested number of pixel-valid candidates; processing the "
                     "accepted candidates that are available. "
                     f"Only generated {len(pending_records)} pixel-valid "
                     f"candidates for {region} voxel {voxel_id} after "
@@ -1769,202 +2185,293 @@ def main():
                 )
 
 
-            ############## Train the ranking model based on voxel id #########################################
-            features_model_folder = os.path.join(
-                args.feature_root,
-                f"S{args.subject_id}",
-                args.rank_model,
-            )
-            print(
-                f"Loading concatenated ranking features from: "
-                f"{features_model_folder} ({', '.join(rank_layer_names)})"
-            )
-
-            (
-                rank_weights,
-                rank_channel_kept,
-                best_lambda_idx,
-                best_nest_loss,
-                rank_lambdas,
-                rank_features_s,
-                rank_features_m,
-            ) = rank_model_fitting(
-                voxel_id,
-                prf_idx,
-                voxel_data,
-                train_ids,
-                val_ids,
-                nest_ids,
-                features_model_folder,
-                rank_layer_names,
-                device,
-            )
-
-            rank_weights = rank_weights[:, 0]
-            rank_intercept = rank_weights[-1].double()
-            rank_weights = rank_weights[:-1].double()
-            rank_features_s = torch.as_tensor(
-                rank_features_s, device=device, dtype=torch.double
-            ).squeeze(0)
-            rank_features_m = torch.as_tensor(
-                rank_features_m, device=device, dtype=torch.double
-            ).squeeze(0)
-            rank_prf_kernels = build_prf_kernels(
-                rank_layer_names, rank_layer_sizes, prf_idx, device
-            )
-            if rank_weights.numel() != int(rank_metadata["num_features"]):
-                raise ValueError(
-                    f"Online ranking fit has {rank_weights.numel()} weights, "
-                    f"but metadata expects {rank_metadata['num_features']}"
+            if args.enable_ranking == 'false':
+                image_records.extend(pending_records)
+            if args.enable_ranking == 'true':
+                ############## Train the ranking model based on voxel id #########################################
+                features_model_folder = os.path.join(
+                    args.feature_root,
+                    f"S{args.subject_id}",
+                    args.rank_model,
+                )
+                print(
+                    f"Loading concatenated ranking features from: "
+                    f"{features_model_folder} ({', '.join(rank_layer_names)})"
                 )
 
-            ranking_model_folder = os.path.join(
-                voxel_folder, "ranking_model"
-            )
-            ranking_model_metadata_path, ranking_model_parameters_path = (
-                save_online_ranking_model(
-                    ranking_model_folder,
-                    subject_id=ss,
-                    region=region,
-                    voxel_id=voxel_id,
-                    voxel_index_in_region=idx,
-                    voxel_rank=voxel_rank,
-                    voxel_r2=topk_values[i],
-                    generation_model_name=args.gen_model,
-                    model_name=args.rank_model,
-                    split_id=args.split_id,
-                    metadata=rank_metadata,
-                    layer_sizes=rank_layer_sizes,
-                    prf_idx=prf_idx,
-                    prf_grid_name=prf_grid_name,
-                    prf_params=prf_grid_params[int(prf_idx)],
-                    weights=rank_weights.detach().cpu().numpy(),
-                    intercept=rank_intercept.detach().cpu().numpy(),
-                    feature_mean=rank_features_m.detach().cpu().numpy(),
-                    feature_std=rank_features_s.detach().cpu().numpy(),
-                    channel_indices=rank_channel_kept,
-                    lambda_candidates=rank_lambdas,
-                    best_lambda_index=best_lambda_idx,
-                    nested_sse=best_nest_loss,
-                    train_ids=train_ids,
-                    val_ids=val_ids,
-                    nest_ids=nest_ids,
-                    features_model_folder=features_model_folder,
-                    ranking_model_path=rank_model_path,
-                    data_splits_path=data_splits_path,
+                (
+                    rank_weights,
+                    rank_channel_kept,
+                    best_lambda_idx,
+                    best_nest_loss,
+                    rank_lambdas,
+                    rank_features_s,
+                    rank_features_m,
+                ) = rank_model_fitting(
+                    voxel_id,
+                    prf_idx,
+                    voxel_data,
+                    train_ids,
+                    val_ids,
+                    nest_ids,
+                    features_model_folder,
+                    rank_layer_names,
+                    device,
                 )
-            )
-            print(
-                f"Saved online ranking model for {region} voxel {voxel_id}: "
-                f"{ranking_model_metadata_path}"
-            )
 
-            while (
-                len(image_records) < args.num_seeds
-                and len(pending_records) > 0
-            ):
-                gen_scores = score_generated_images_for_voxel(
-                    image_records=pending_records,
-                    layer_names=gen_layer_names,
-                    prf_kernels=gen_prf_kernels,
-                    voxel_weights=weights,
-                    voxel_intercept=intercept,
-                    features_s=features_s,
-                    features_m=features_m,
-                    model_name=args.gen_model,
-                    batch_size=8,
-                    encoder=brain_encoder,
+                rank_weights = rank_weights[:, 0]
+                rank_intercept = rank_weights[-1].double()
+                rank_weights = rank_weights[:-1].double()
+                rank_features_s = torch.as_tensor(
+                    rank_features_s, device=device, dtype=torch.double
+                ).squeeze(0)
+                rank_features_m = torch.as_tensor(
+                    rank_features_m, device=device, dtype=torch.double
+                ).squeeze(0)
+                rank_prf_kernels = build_prf_kernels(
+                    rank_layer_names, rank_layer_sizes, prf_idx, device
                 )
-                pred_scores = score_generated_images_for_voxel(
-                    image_records=pending_records,
-                    layer_names=rank_layer_names,
-                    prf_kernels=rank_prf_kernels,
-                    voxel_weights=rank_weights,
-                    voxel_intercept=rank_intercept,
-                    features_s=rank_features_s,
-                    features_m=rank_features_m,
-                    model_name=args.rank_model,
-                    batch_size=8,
-                )
-                for item, gen_score, rank_score in zip(
-                    pending_records, gen_scores, pred_scores
-                ):
-                    gen_score = float(gen_score)
-                    rank_score = float(rank_score)
-                    score_is_valid = True
-                    if not np.isfinite(gen_score):
-                        rejected_candidates["nonfinite_gen_score"] += 1
-                        score_is_valid = False
-                    if not np.isfinite(rank_score):
-                        rejected_candidates["nonfinite_rank_score"] += 1
-                        score_is_valid = False
-                    if score_is_valid:
-                        item["gen_score"] = gen_score
-                        item["rank_score"] = rank_score
-                        image_records.append(item)
-                    else:
-                        print(
-                            f"Rejected seed {item['seed']}: non-finite score "
-                            f"(gen={gen_score}, rank={rank_score})"
-                        )
-                        item["tensor"] = None
-
-                if len(image_records) >= args.num_seeds:
-                    break
-                missing = args.num_seeds - len(image_records)
-                pending_records = generate_pixel_valid_candidates(missing)
-                if not pending_records:
-                    print(
-                        "Generation attempt limit reached before collecting "
-                        "the requested number of fully valid candidates; "
-                        "ranking the accepted candidates that are available. "
-                        f"Only generated {len(image_records)} fully valid "
-                        f"candidates for {region} voxel {voxel_id} after "
-                        f"{len(attempted_seeds)} attempts "
-                        f"(limit {max_generation_attempts}). "
-                        f"Rejections: {rejected_candidates}"
+                if rank_weights.numel() != int(rank_metadata["num_features"]):
+                    raise ValueError(
+                        f"Online ranking fit has {rank_weights.numel()} weights, "
+                        f"but metadata expects {rank_metadata['num_features']}"
                     )
-                    break
 
+                ranking_model_folder = os.path.join(
+                    voxel_folder, "ranking_model"
+                )
+                ranking_model_metadata_path, ranking_model_parameters_path = (
+                    save_online_ranking_model(
+                        ranking_model_folder,
+                        subject_id=ss,
+                        region=region,
+                        voxel_id=voxel_id,
+                        voxel_index_in_region=idx,
+                        voxel_rank=voxel_rank,
+                        voxel_r2=topk_values[i],
+                        generation_model_name=args.gen_model,
+                        model_name=args.rank_model,
+                        split_id=args.split_id,
+                        metadata=rank_metadata,
+                        layer_sizes=rank_layer_sizes,
+                        prf_idx=prf_idx,
+                        prf_grid_name=prf_grid_name,
+                        prf_params=prf_grid_params[int(prf_idx)],
+                        weights=rank_weights.detach().cpu().numpy(),
+                        intercept=rank_intercept.detach().cpu().numpy(),
+                        feature_mean=rank_features_m.detach().cpu().numpy(),
+                        feature_std=rank_features_s.detach().cpu().numpy(),
+                        channel_indices=rank_channel_kept,
+                        lambda_candidates=rank_lambdas,
+                        best_lambda_index=best_lambda_idx,
+                        nested_sse=best_nest_loss,
+                        train_ids=train_ids,
+                        val_ids=val_ids,
+                        nest_ids=nest_ids,
+                        features_model_folder=features_model_folder,
+                        ranking_model_path=rank_model_path,
+                        data_splits_path=data_splits_path,
+                    )
+                )
+                print(
+                    f"Saved online ranking model for {region} voxel {voxel_id}: "
+                    f"{ranking_model_metadata_path}"
+                )
+
+                while (
+                    len(image_records) < args.num_seeds
+                    and len(pending_records) > 0
+                ):
+                    gen_scores = score_generated_images_for_voxel(
+                        image_records=pending_records,
+                        layer_names=gen_layer_names,
+                        prf_kernels=gen_prf_kernels,
+                        voxel_weights=weights,
+                        voxel_intercept=intercept,
+                        features_s=features_s,
+                        features_m=features_m,
+                        model_name=args.gen_model,
+                        batch_size=8,
+                        encoder=brain_encoder,
+                    )
+                    pred_scores = score_generated_images_for_voxel(
+                        image_records=pending_records,
+                        layer_names=rank_layer_names,
+                        prf_kernels=rank_prf_kernels,
+                        voxel_weights=rank_weights,
+                        voxel_intercept=rank_intercept,
+                        features_s=rank_features_s,
+                        features_m=rank_features_m,
+                        model_name=args.rank_model,
+                        batch_size=8,
+                    )
+                    for item, gen_score, rank_score in zip(
+                        pending_records, gen_scores, pred_scores
+                    ):
+                        gen_score = float(gen_score)
+                        rank_score = float(rank_score)
+                        score_is_valid = True
+                        if not np.isfinite(gen_score):
+                            rejected_candidates["nonfinite_gen_score"] += 1
+                            score_is_valid = False
+                        if not np.isfinite(rank_score):
+                            rejected_candidates["nonfinite_rank_score"] += 1
+                            score_is_valid = False
+                        if score_is_valid:
+                            item["gen_score"] = gen_score
+                            item["rank_score"] = rank_score
+                            image_records.append(item)
+                        else:
+                            print(
+                                f"Rejected seed {item['seed']}: non-finite score "
+                                f"(gen={gen_score}, rank={rank_score})"
+                            )
+                            item["tensor"] = None
+                            item["raw_tensor"] = None
+
+                    checkpoint_seeds()
+                    if len(image_records) >= args.num_seeds:
+                        break
+                    missing = args.num_seeds - len(image_records)
+                    pending_records = generate_pixel_valid_candidates(missing)
+                    if not pending_records:
+                        print(
+                            "Generation attempt limit reached before collecting "
+                            "the requested number of fully valid candidates; "
+                            "ranking the accepted candidates that are available. "
+                            f"Only generated {len(image_records)} fully valid "
+                            f"candidates for {region} voxel {voxel_id} after "
+                            f"{len(attempted_seeds)} attempts "
+                            f"(limit {max_generation_attempts}). "
+                            f"Rejections: {rejected_candidates}"
+                        )
+                        break
+
+            checkpoint_seeds('complete' if len(image_records) >= args.num_seeds
+                             else 'partial_seed_budget_exhausted')
             ranked_indices = sorted(
                 range(len(image_records)),
                 key=lambda j: image_records[j]["rank_score"],
                 reverse=True,
-            )
+            ) if args.enable_ranking == 'true' else list(range(len(image_records)))
+            generation_ranked_indices = sorted(
+                range(len(image_records)),
+                key=lambda j: image_records[j]["gen_score"],
+                reverse=True,
+            ) if args.enable_ranking == 'true' else []
+            generation_ranks = {
+                img_idx: rank for rank, img_idx in enumerate(generation_ranked_indices, start=1)
+            }
+            ranking_model_ranks = {
+                img_idx: rank for rank, img_idx in enumerate(ranked_indices, start=1)
+            } if args.enable_ranking == 'true' else {}
 
-            requested_top_n = max(1, int(args.ranking_top_n))
-            top_n = min(requested_top_n, len(ranked_indices))
+            requested_top_n = args.ranking_top_n if args.enable_ranking == 'true' else 'all'
+            top_n = (len(ranked_indices) if requested_top_n == "all"
+                     else min(requested_top_n, len(ranked_indices)))
             top_ranked = []
+            selected_indices = set(ranked_indices[:top_n])
+            candidate_rankings = [
+                {
+                    'seed': item['seed'],
+                    'gen_rank': generation_ranks[img_idx],
+                    'rank_model_rank': ranking_model_ranks[img_idx],
+                    'gen_score': item['gen_score'],
+                    'rank_score': item['rank_score'],
+                    'saved': img_idx in selected_indices,
+                }
+                for img_idx, item in enumerate(image_records)
+            ] if args.enable_ranking == 'true' else []
             for rank_idx, img_idx in enumerate(ranked_indices[:top_n], start=1):
                 item = image_records[img_idx]
                 ranked_image_name = (
-                    f"rank-{rank_idx:02d}__seed-{item['seed']:010d}.png"
+                    f"seed-{item['seed']:010d}.png"
                 )
-                ranked_image_path = os.path.join(images_folder, ranked_image_name)
-                image_array = item["tensor"].permute(1, 2, 0).numpy()
-                pil_image = Image.fromarray(
-                    np.rint(np.clip(image_array, 0, 1) * 255).astype(np.uint8),
-                    mode="RGB",
-                )
-                pil_image.save(ranked_image_path, format="PNG", compress_level=6)
-                pil_image.close()
+                ranked_image_path = None
+                if images_folder is not None:
+                    ranked_image_path = os.path.join(images_folder, ranked_image_name)
+                    image_array = item["tensor"].permute(1, 2, 0).numpy()
+                    pil_image = Image.fromarray(
+                        np.rint(np.clip(image_array, 0, 1) * 255).astype(np.uint8),
+                        mode="RGB",
+                    )
+                    pil_image.save(ranked_image_path, format="PNG", compress_level=6)
+                    pil_image.close()
+                raw_image_path = None
+                if (
+                    item["raw_tensor"] is not None
+                    and unconstrained_images_folder is not None
+                ):
+                    # Same basename as the constrained image so the pair can
+                    # be matched across the two folders by filename alone.
+                    raw_image_path = os.path.join(
+                        unconstrained_images_folder, ranked_image_name
+                    )
+                    raw_array = item["raw_tensor"].permute(1, 2, 0).numpy()
+                    raw_pil_image = Image.fromarray(
+                        np.rint(
+                            np.clip(raw_array, 0, 1) * 255
+                        ).astype(np.uint8),
+                        mode="RGB",
+                    )
+                    raw_pil_image.save(
+                        raw_image_path, format="PNG", compress_level=6
+                    )
+                    raw_pil_image.close()
                 top_ranked.append({
                     "seed": item["seed"],
-                    "rank": rank_idx,
-                    "gen_score": item["gen_score"],
-                    "rank_score": item["rank_score"],
+                    **({
+                        "rank": rank_idx,
+                        "gen_rank": generation_ranks[img_idx],
+                        "rank_model_rank": ranking_model_ranks[img_idx],
+                        "gen_score": item["gen_score"],
+                        "rank_score": item["rank_score"],
+                    } if args.enable_ranking == 'true' else {}),
                     "rms_contrast_byte": item["rms_contrast_byte"],
                     "contrast_diagnostics": item["contrast_diagnostics"],
                     "dual_scope_solver": item["dual_scope_solver"],
-                    "image_file": os.path.join("images", ranked_image_name),
-                    "image_path": os.path.abspath(ranked_image_path),
+                    "joint_luma_rms_solver": item["joint_luma_rms_solver"],
+                    "luma_rgb_clip_diagnostics": item.get("luma_rgb_clip_diagnostics"),
+                    "guidance_constraint_diagnostics": item["guidance_constraint_diagnostics"],
+                    "image_file": os.path.join("images", ranked_image_name) if ranked_image_path else None,
+                    "image_path": os.path.abspath(ranked_image_path) if ranked_image_path else None,
+                    "raw_rms_contrast_byte": item["raw_rms_contrast_byte"],
+                    "raw_image_file": (
+                        os.path.join(
+                            "unconstrained_images", ranked_image_name
+                        )
+                        if raw_image_path is not None
+                        else None
+                    ),
+                    "raw_image_path": (
+                        os.path.abspath(raw_image_path)
+                        if raw_image_path is not None
+                        else None
+                    ),
                 })
 
-            ranking_file = os.path.join(voxel_folder, "ranking.json")
+            ranking_file = os.path.join(
+                voxel_folder, "ranking.json" if args.enable_ranking == 'true' else "generation.json")
             with open(ranking_file, "w") as f:
                 json.dump(
-                    {
-                        "schema_version": 6,
+                    generation_summary_for_mode({
+                        "schema_version": 15,
+                        "image_saving": image_saving_metadata,
+                        "generation_model": {"name": args.gen_model, "layers": list(gen_layer_names)},
+                        "split": int(args.split_id),
+                        "ranking_definitions": {
+                            "gen_rank": {"model": args.gen_model, "score": "gen_score"},
+                            "rank_model_rank": {"model": args.rank_model, "score": "rank_score"},
+                            "scope": "all_fully_valid_candidates_for_this_voxel",
+                            "order": "descending_score_1_is_best",
+                            "ties": "accepted_candidate_order",
+                            "selection": "rank_model_rank",
+                            "score_image_version": (
+                                "unadjusted_final_decode" if args.image_save_mode == 'unconstrained_only'
+                                else "pipeline_output_after_final_adjustment_if_enabled"),
+                            "legacy_rank_field": "alias_of_rank_model_rank",
+                        },
+                        "candidate_rankings": candidate_rankings,
                         "region": region,
                         "subject": int(ss),
                         "voxel_id": int(voxel_id),
@@ -1992,6 +2499,10 @@ def main():
                         # Retained for compatibility with existing readers.
                         "num_candidates": int(len(image_records)),
                         "generation_attempts": int(len(attempted_seeds)),
+                        "seed_record": "seeds.json",
+                        "generation_timing": summarize_generation_times(seed_generation_times),
+                        "seed_mode": args.seed_mode,
+                        "seed_plan_id": seed_plan['plan_id'],
                         "max_generation_attempts": int(max_generation_attempts),
                         "max_generation_attempts_reached": bool(
                             len(attempted_seeds) >= max_generation_attempts
@@ -1999,13 +2510,31 @@ def main():
                         "contrast_validation_tolerance_byte": float(
                             args.contrast_validation_tolerance
                         ),
-                        "contrast_constraint_timing": (
-                            args.contrast_constraint_timing
+                        "contrast_constraint_method": (
+                            args.contrast_constraint_method
                         ),
-                        "contrast_constraint_scope": (
-                            args.contrast_constraint_scope
+                        "contrast_constraint_full_image": (
+                            args.contrast_constraint_full_image
                         ),
-                        "contrast_acceptance_domain": "unquantized_float",
+                        "contrast_constraint_prf": (
+                            args.contrast_constraint_prf
+                        ),
+                        "contrast_acceptance_domain": acceptance_domain,
+                        "constraint_projection": constraint_method_metadata,
+                        "luminance": luminance_metadata,
+                        "image_save_mode": args.image_save_mode,
+                        "constrained_image_saved": save_constrained_images,
+                        "unconstrained_image_saved": bool(
+                            save_unconstrained_images
+                        ),
+                        "unconstrained_image_content": (
+                            unconstrained_image_content
+                        ),
+                        "unconstrained_images_folder": (
+                            os.path.abspath(unconstrained_images_folder)
+                            if unconstrained_images_folder is not None
+                            else None
+                        ),
                         "contrast_target_rms_byte": (
                             float(args.target_rms_contrast)
                             if args.target_rms_contrast is not None
@@ -2028,7 +2557,8 @@ def main():
                             "prf_weight_sum": 1.0,
                         },
                         "rejected_candidates": rejected_candidates,
-                        "ranking_top_n_requested": int(requested_top_n),
+                        "ranking_top_n_requested": requested_top_n,
+                        "saved_image_count": int(top_n),
                         "ranking_top_n_returned": int(top_n),
                         # Retained for compatibility with existing readers.
                         "ranking_top_n": int(top_n),
@@ -2039,9 +2569,9 @@ def main():
                             "parameters_file": os.path.relpath(
                                 ranking_model_parameters_path, voxel_folder
                             ),
-                        },
+                        } if args.enable_ranking == 'true' else None,
                         "results": top_ranked,
-                    },
+                    }, args.enable_ranking == 'true'),
                     f,
                     indent=2,
                     allow_nan=False,
@@ -2050,12 +2580,13 @@ def main():
             # Release temporary image tensors after each voxel.
             for item in image_records:
                 item["tensor"] = None
+                item["raw_tensor"] = None
             del ranked_indices
             del image_records
             gc.collect()
             torch.cuda.empty_cache()
 
-            if len(top_ranked) > 0:
+            if len(top_ranked) > 0 and args.enable_ranking == 'true':
                 print(
                     f"Voxel ranking complete for {region} voxel {voxel_id}: "
                     f"best_seed={top_ranked[0]['seed']}, "
@@ -2063,6 +2594,8 @@ def main():
                     f"kept_top_n={top_n}, "
                     f"saved={ranking_file}"
                 )
+            elif args.enable_ranking == 'false':
+                print(f"Generation complete for {region} voxel {voxel_id}: saved={top_n}; metadata={ranking_file}")
 
 
     if args.generation_timing_file is not None:
@@ -2078,6 +2611,7 @@ def main():
         with open(args.generation_timing_file, "w") as timing_handle:
             json.dump(timing_payload, timing_handle, indent=2)
         print(f"Generation-only timing: {timing_payload}")
+
 
 
 if __name__ == "__main__":

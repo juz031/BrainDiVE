@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --output=/home/junruz/BrainDiVE/script/slurm_out/slurm-concat-%A_%a.out
 #SBATCH -N 1
-#SBATCH --job-name=pd_s1_v4
-#SBATCH --time=14-00:00:00
+#SBATCH --job-name=prf_concat_dive
+#SBATCH --time=10-00:00:00
 #SBATCH -p gpu
 #SBATCH --gres=gpu:1
-#SBATCH --exclude=mind-0-18,mind-0-20,mind-0-22,mind-0-24,mind-1-11,mind-1-24,mind-1-19-1,mind-1-19-2,mind-0-28
+#SBATCH --exclude=mind-0-18,mind-0-20,mind-0-22,mind-0-24
 #SBATCH --mem=32G
 #SBATCH --cpus-per-gpu=4
 #SBATCH --array=0-1%2
@@ -44,15 +44,19 @@ RANK_MODEL=${RANK_MODELS[$TASK_ID]}
 
 # Seed mode: random, file, or fixed. File mode loads an ordered JSON list.
 # Submission examples (from /home/junruz/BrainDiVE):
-# sbatch --export=ALL,SEED_MODE=random script/run_img_gen_prf_concat_model_rank.job
-# sbatch --export=ALL,SEED_MODE=fixed,SEED_GENERATOR_SEED=42 script/run_img_gen_prf_concat_model_rank.job
-# sbatch --export=ALL,SEED_MODE=file,SEED_FILE=/path/to/seeds.json,SEED_FILE_KEY=valid_seeds script/run_img_gen_prf_concat_model_rank.job
+# sbatch --export=ALL,SEED_MODE=random script/test_img_gen_prf_concat_model_rank.job
+# sbatch --export=ALL,SEED_MODE=fixed,SEED_GENERATOR_SEED=42 script/test_img_gen_prf_concat_model_rank.job
+# sbatch --export=ALL,SEED_MODE=file,SEED_FILE=/path/to/seeds.json,SEED_FILE_KEY=valid_seeds script/test_img_gen_prf_concat_model_rank.job
 # Use the same fixed seed/file for matched sequences across DINO and ADV.
 # Leave SEED_FILE empty outside file mode and SEED_GENERATOR_SEED empty
 # outside fixed mode. Per-voxel seeds.json records attempts and valid seeds.
 SEED_MODE=${SEED_MODE:-fixed}
-SEED_FILE=${SEED_FILE:-}
-SEED_FILE_KEY=${SEED_FILE_KEY:-all_seeds_attempted}
+if [[ "${SEED_MODE}" == "file" ]]; then
+    SEED_FILE=${SEED_FILE-/user_data/junruz/BrainDiVE/contrast_full_prf_concat_small_scale/pRF_concat_model_ranked/sub-01/gen-ADV_RN50-concat__rank-OPEN_CLIP_RN50-concat/split-01__steps-100__scale-750__sag-0.75__contrast-match-rms57.48__full-every_step__prf-every_step__luma-full-every_step-116__luma-prf-every_step-116__seeds-10__keep-all/seed-random-880caab4d307fb70/roi-hV4/voxel-rank-01__id-013177/seeds.json}
+else
+    SEED_FILE=${SEED_FILE:-}
+fi
+SEED_FILE_KEY=${SEED_FILE_KEY:-seed_set}
 SEED_GENERATOR_SEED=${SEED_GENERATOR_SEED:-42}
 case "${SEED_MODE}" in
     random) ;;
@@ -93,13 +97,13 @@ case "${GEN_MODEL}" in
         ;;
 esac
 
-# Full experiment defaults; override with sbatch --export as in the test script.
+# Small experiment defaults; each can be overridden with sbatch --export.
 SUBJECT_ID=${SUBJECT_ID:-1}
 SPLIT_ID=${SPLIT_ID:-1}
 FEATURE_ROOT=${FEATURE_ROOT:-/user_data/junruz/prf_features}
 MODEL_ROOT=${MODEL_ROOT:-/user_data/junruz/prf_models/concat/split_1_zscore}
-NUM_SEEDS=${NUM_SEEDS:-1000}
-NUM_STEPS=${NUM_STEPS:-100}
+NUM_SEEDS=${NUM_SEEDS:-10}
+NUM_STEPS=${NUM_STEPS:-75}
 SAG_SCALE=${SAG_SCALE:-0.75}
 RANKING_TOP_N=${RANKING_TOP_N:-all}
 ENABLE_RANKING=${ENABLE_RANKING:-false}
@@ -107,11 +111,11 @@ ENABLE_RANKING=${ENABLE_RANKING:-false}
 IMAGE_SAVE_MODE=${IMAGE_SAVE_MODE:-unconstrained_only}
 ROI=${ROI:-hV4}
 VOXEL_RANK_START=${VOXEL_RANK_START:-1}
-VOXEL_RANK_END=${VOXEL_RANK_END:-20}
-SAVE_ROOT=${SAVE_ROOT:-/user_data/junruz/BrainDiVE/ICLR2026/pRF_concat_model}
+VOXEL_RANK_END=${VOXEL_RANK_END:-3}
+SAVE_ROOT=${SAVE_ROOT:-/user_data/junruz/BrainDiVE/contrast_full_prf_concat_small_scale_iclr_test_final_final/pRF_concat_model_ranked}
 
-# Total attempts per voxel, including rejected seeds; override with sbatch --export.
-MAX_GENERATION_ATTEMPTS=${MAX_GENERATION_ATTEMPTS:-1200}
+# Empty attempt limit retains Python's seed-mode-aware default.
+MAX_GENERATION_ATTEMPTS=${MAX_GENERATION_ATTEMPTS:-}
 DUAL_SCOPE_SOLVER_MAX_NFEV=${DUAL_SCOPE_SOLVER_MAX_NFEV:-300}
 DUAL_SCOPE_EVERY_STEP_ITERATIONS=${DUAL_SCOPE_EVERY_STEP_ITERATIONS:-30}
 DUAL_SCOPE_PARAMETER_LIMIT=${DUAL_SCOPE_PARAMETER_LIMIT:-8.0}
@@ -147,13 +151,15 @@ MIN_CONTRAST_PERCENTILE=${MIN_CONTRAST_PERCENTILE:-5}
 MAX_CONTRAST_PERCENTILE=${MAX_CONTRAST_PERCENTILE:-95}
 CONTRAST_STATS_JSON=${CONTRAST_STATS_JSON:-${MODEL_ROOT}/S${SUBJECT_ID}/nsd_contrast_statistics.json}
 
-# Mean Rec.709 luma, in 0-255 units. Omitted targets use the same dataset
-# mean from CONTRAST_STATS_JSON for both scopes; explicit targets override it.
+# Omitted targets use luminance_mean.byte_0_255.mean from CONTRAST_STATS_JSON
+# for both scopes. Explicit targets override their respective defaults.
 # With luma_rgb_clip, change the matching contrast timings as well (examples below).
 LUMINANCE_FULL_IMAGE=${LUMINANCE_FULL_IMAGE:-every_step}
 LUMINANCE_PRF=${LUMINANCE_PRF:-final}
-TARGET_LUMINANCE_FULL_IMAGE=${TARGET_LUMINANCE_FULL_IMAGE:-116}
-TARGET_LUMINANCE_PRF=${TARGET_LUMINANCE_PRF:-116}
+# Preserve the small experiment's 116 default; explicitly export an empty
+# target to use the subject's NSD mean instead (no Python target override).
+TARGET_LUMINANCE_FULL_IMAGE=${TARGET_LUMINANCE_FULL_IMAGE-116}
+TARGET_LUMINANCE_PRF=${TARGET_LUMINANCE_PRF-116}
 LUMINANCE_TOLERANCE_BYTE=${LUMINANCE_TOLERANCE_BYTE:-3}
 
 # Method is independent of timing. The new method enforces tolerances on
@@ -187,7 +193,6 @@ case "${LUMA_CONTRAST_METHOD}" in
     joint_solver) ;;
     *) echo "Unsupported LUMA_CONTRAST_METHOD: ${LUMA_CONTRAST_METHOD}" >&2; exit 1 ;;
 esac
-
 
 contrast_stage_rank() {
     case "$1" in
@@ -352,7 +357,6 @@ fi
 echo "Output method directory: method-${LUMA_CONTRAST_METHOD} (below the ranking-mode directory)"
 echo "Luminance targets (byte units, when enabled): full=${TARGET_LUMINANCE_FULL_IMAGE:-dataset mean}, prf=${TARGET_LUMINANCE_PRF:-dataset mean}"
 echo "NSD statistics: ${CONTRAST_STATS_JSON}"
-echo "Ranking images to save: ${RANKING_TOP_N}"
 printf 'Contrast arguments:'
 printf ' %q' "${CONTRAST_ARGS[@]}"
 printf '\n'
@@ -360,7 +364,7 @@ printf 'Luminance/method arguments:'
 printf ' %q' "${LUMINANCE_ARGS[@]}"
 printf '\n'
 
-# Generate the requested inclusive voxel-rank range.
+# Run the small experiment without changing the full-size launcher.
 python -u run_image_generation_concat_pRF_model_ranking.py \
     --subject_id "${SUBJECT_ID}" \
     --gen_model "${GEN_MODEL}" \

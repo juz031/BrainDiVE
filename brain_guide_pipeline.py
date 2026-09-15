@@ -33,6 +33,15 @@ from diffusers.models import AutoencoderKL, UNet2DConditionModel
 
 import random
 
+from joint_luma_contrast_utils import (
+    active_joint_targets, match_luma_and_rms, joint_result_to_jsonable,
+    validate_luminance_settings,
+)
+from luma_rgb_clip_utils import (
+    validate_luma_contrast_method, match_luma_rgb_clip,
+    accumulate_guidance_diagnostics,
+)
+
 from dual_scope_contrast_utils import (
     match_global_and_prf_rms_contrast_final,
     match_global_and_prf_rms_contrast_torch,
@@ -43,8 +52,11 @@ from dual_scope_contrast_utils import (
 
 
 CONTRAST_CONSTRAINT_METHODS = ("none", "max", "range", "match")
-CONTRAST_CONSTRAINT_TIMINGS = ("every_step", "final")
-CONTRAST_CONSTRAINT_SCOPES = ("full_image", "full_image_and_prf")
+# Each constraint names the stage it starts at. "every_step" projects before
+# every brain-guidance evaluation and again after the last diffusion step;
+# "final" projects only after the last step.
+CONTRAST_CONSTRAINT_STAGES = ("none", "final", "every_step")
+_CONTRAST_STAGE_RANK = {"none": 0, "final": 1, "every_step": 2}
 
 
 def _validate_contrast_constraint(
@@ -93,29 +105,44 @@ def _validate_contrast_constraint(
         )
 
 
-def _validate_contrast_constraint_timing(timing):
-    if timing not in CONTRAST_CONSTRAINT_TIMINGS:
-        raise ValueError(
-            "contrast_constraint_timing must be one of "
-            f"{CONTRAST_CONSTRAINT_TIMINGS}, got {timing!r}."
-        )
+def _validate_contrast_constraint_stages(
+    full_image_stage,
+    prf_stage,
+    method=None,
+    spatial_weight=None,
+):
+    """Validate the whole-image and soft-pRF constraint stages.
 
-
-def _validate_contrast_constraint_scope(scope, method, spatial_weight):
-    if scope not in CONTRAST_CONSTRAINT_SCOPES:
-        raise ValueError(
-            "contrast_constraint_scope must be one of "
-            f"{CONTRAST_CONSTRAINT_SCOPES}, got {scope!r}."
-        )
-    if scope == "full_image_and_prf":
-        if method != "match":
+    The dual-scope solver drives both RMS statistics to one shared target
+    with a single two-parameter transform, so there is no pRF-only
+    projection: the pRF constraint can never run at a stage where the
+    whole-image constraint does not.
+    """
+    for name, stage in (
+        ("contrast_constraint_full_image", full_image_stage),
+        ("contrast_constraint_prf", prf_stage),
+    ):
+        if stage not in CONTRAST_CONSTRAINT_STAGES:
             raise ValueError(
-                "The 'full_image_and_prf' scope requires the 'match' "
-                "contrast method."
+                f"{name} must be one of {CONTRAST_CONSTRAINT_STAGES}, "
+                f"got {stage!r}."
+            )
+    if _CONTRAST_STAGE_RANK[prf_stage] > _CONTRAST_STAGE_RANK[full_image_stage]:
+        raise ValueError(
+            "contrast_constraint_prf cannot run at a stage where "
+            "contrast_constraint_full_image does not, because the "
+            "dual-scope solver drives both statistics to the same target; "
+            f"got prf={prf_stage!r} with full_image={full_image_stage!r}."
+        )
+    if prf_stage != "none":
+        if method is not None and method != "match":
+            raise ValueError(
+                "contrast_constraint_prf requires the 'match' contrast "
+                f"method, got {method!r}."
             )
         if spatial_weight is None:
             raise ValueError(
-                "The 'full_image_and_prf' scope requires contrast_prf_weight."
+                "contrast_constraint_prf requires contrast_prf_weight."
             )
 
 
@@ -202,8 +229,8 @@ def prepare_brain_guidance_image(
     image_01,
     *,
     contrast_constraint_method,
-    contrast_constraint_timing,
-    contrast_constraint_scope="full_image",
+    contrast_constraint_full_image,
+    contrast_constraint_prf="none",
     contrast_prf_weight=None,
     min_rms_contrast=None,
     max_rms_contrast=None,
@@ -212,18 +239,68 @@ def prepare_brain_guidance_image(
     dual_scope_every_step_iterations=10,
     dual_scope_parameter_limit=8.0,
     dual_scope_envelope_power=0.5,
+    luminance_constraint_full_image="none",
+    luminance_constraint_prf="none",
+    target_luminance_full_image=None,
+    target_luminance_prf=None,
+    luminance_validation_tolerance=0.01 / 255,
+    luminance_shift_limit=1.0,
+    luma_contrast_method="joint_solver",
+    luma_rgb_clip_match_iterations=20,
+    guidance_constraint_diagnostics=None,
 ):
     """Return the image that the brain objective should evaluate."""
     require_finite_seed_image(image_01, stage="brain-guidance decode")
-    _validate_contrast_constraint_timing(contrast_constraint_timing)
-    _validate_contrast_constraint_scope(
-        contrast_constraint_scope,
+    _validate_contrast_constraint_stages(
+        contrast_constraint_full_image,
+        contrast_constraint_prf,
         contrast_constraint_method,
         contrast_prf_weight,
     )
-    if contrast_constraint_timing == "final":
+    validate_luminance_settings(
+        luminance_constraint_full_image, luminance_constraint_prf,
+        target_luminance_full_image, target_luminance_prf,
+        luminance_validation_tolerance, contrast_constraint_full_image,
+        contrast_constraint_method, luminance_shift_limit,
+    )
+    validate_luma_contrast_method(
+        luma_contrast_method, contrast_constraint_full_image, contrast_constraint_prf,
+        luminance_constraint_full_image, luminance_constraint_prf,
+        contrast_constraint_method, luma_rgb_clip_match_iterations,
+    )
+    if luminance_constraint_full_image == "every_step":
+        targets = active_joint_targets(
+            "every_step", contrast_constraint_full_image, contrast_constraint_prf,
+            luminance_constraint_full_image, luminance_constraint_prf,
+            target_rms_contrast, target_luminance_full_image, target_luminance_prf,
+        )
+        if luma_contrast_method == "luma_rgb_clip":
+            output, diagnostics = match_luma_rgb_clip(
+                image_01, contrast_prf_weight, **targets, differentiable=True,
+                match_iterations=luma_rgb_clip_match_iterations,
+                iterations=dual_scope_every_step_iterations,
+                mean_tolerance=luminance_validation_tolerance,
+                rms_tolerance=dual_scope_tolerance,
+                log_scale_limit=dual_scope_parameter_limit,
+                shift_limit=luminance_shift_limit,
+                adjustment_envelope_power=dual_scope_envelope_power,
+            )
+            accumulate_guidance_diagnostics(guidance_constraint_diagnostics, diagnostics)
+            return output
+        return match_luma_and_rms(
+            image_01, contrast_prf_weight, **targets, differentiable=True,
+            iterations=dual_scope_every_step_iterations,
+            mean_tolerance=luminance_validation_tolerance,
+            rms_tolerance=dual_scope_tolerance,
+            log_scale_limit=dual_scope_parameter_limit,
+            shift_limit=luminance_shift_limit,
+            adjustment_envelope_power=dual_scope_envelope_power,
+        ).images
+    if contrast_constraint_full_image != "every_step":
+        # Nothing is constrained inside the loop; any projection this run
+        # asks for happens after the last diffusion step instead.
         return image_01
-    if contrast_constraint_scope == "full_image_and_prf":
+    if contrast_constraint_prf == "every_step":
         result = match_global_and_prf_rms_contrast_torch(
             image_01,
             contrast_prf_weight,
@@ -705,8 +782,8 @@ class mypipelineSAG(DiffusionPipeline):
                 noise_pred_original,
                 clip_guidance_scale,
                 contrast_constraint_method,
-                contrast_constraint_timing,
-                contrast_constraint_scope,
+                contrast_constraint_full_image,
+                contrast_constraint_prf,
                 contrast_prf_weight,
                 min_rms_contrast,
                 max_rms_contrast,
@@ -714,7 +791,8 @@ class mypipelineSAG(DiffusionPipeline):
                 dual_scope_tolerance,
                 dual_scope_every_step_iterations,
                 dual_scope_parameter_limit,
-                dual_scope_envelope_power):
+                dual_scope_envelope_power,
+                luminance_options=None):
         latents = latents.detach().requires_grad_()
         latent_model_input = self.scheduler.scale_model_input(latents, timestep)
 
@@ -751,8 +829,8 @@ class mypipelineSAG(DiffusionPipeline):
         model_image = prepare_brain_guidance_image(
             image.float(),
             contrast_constraint_method=contrast_constraint_method,
-            contrast_constraint_timing=contrast_constraint_timing,
-            contrast_constraint_scope=contrast_constraint_scope,
+            contrast_constraint_full_image=contrast_constraint_full_image,
+            contrast_constraint_prf=contrast_constraint_prf,
             contrast_prf_weight=contrast_prf_weight,
             min_rms_contrast=min_rms_contrast,
             max_rms_contrast=max_rms_contrast,
@@ -761,6 +839,7 @@ class mypipelineSAG(DiffusionPipeline):
             dual_scope_every_step_iterations=dual_scope_every_step_iterations,
             dual_scope_parameter_limit=dual_scope_parameter_limit,
             dual_scope_envelope_power=dual_scope_envelope_power,
+            **(luminance_options or {}),
         )
         loss = self.brain_tweak(model_image) * clip_guidance_scale
         # print(f"The loss is {loss}")
@@ -817,8 +896,8 @@ class mypipelineSAG(DiffusionPipeline):
             sag_scale: float = 0.75,
             clip_guidance_scale=100.0,
             contrast_constraint_method: Optional[str] = None,
-            contrast_constraint_timing: str = "every_step",
-            contrast_constraint_scope: str = "full_image",
+            contrast_constraint_full_image: str = "every_step",
+            contrast_constraint_prf: str = "none",
             contrast_prf_weight: Optional[torch.Tensor] = None,
             min_rms_contrast: Optional[float] = None,
             max_rms_contrast: Optional[float] = None,
@@ -828,6 +907,16 @@ class mypipelineSAG(DiffusionPipeline):
             dual_scope_every_step_iterations: int = 10,
             dual_scope_parameter_limit: float = 8.0,
             dual_scope_envelope_power: float = 0.5,
+            luminance_constraint_full_image: str = "none",
+            luminance_constraint_prf: str = "none",
+            target_luminance_full_image: Optional[float] = None,
+            target_luminance_prf: Optional[float] = None,
+            luminance_validation_tolerance: float = 0.01 / 255,
+            luminance_shift_limit: float = 1.0,
+            # Legacy shared-pipeline callers retain their existing behavior;
+            # the concat runner explicitly selects its new luma_rgb_clip default.
+            luma_contrast_method: str = "joint_solver",
+            luma_rgb_clip_match_iterations: int = 20,
             negative_prompt: Optional[Union[str, List[str]]] = None,
             num_images_per_prompt: Optional[int] = 1,
             eta: float = 0.0,
@@ -840,6 +929,7 @@ class mypipelineSAG(DiffusionPipeline):
             callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
             callback_steps: Optional[int] = 1,
             cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+            apply_final_adjustment: bool = True,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -865,13 +955,32 @@ class mypipelineSAG(DiffusionPipeline):
                 SAG scale as defined in [Improving Sample Quality of Diffusion Models Using Self-Attention Guidance]
                 (https://arxiv.org/abs/2210.00939). `sag_scale` is defined as `s_s` of equation (24) of SAG paper:
                 https://arxiv.org/pdf/2210.00939.pdf. Typically chosen between [0, 1.0] for better quality.
-            contrast_constraint_timing (`str`, *optional*, defaults to `"every_step"`):
-                Whether to project contrast before every brain-guidance
-                evaluation (`"every_step"`) or only after the complete
-                denoising loop (`"final"`).
-            contrast_constraint_scope (`str`, *optional*, defaults to `"full_image"`):
-                Match only whole-image contrast, or match both whole-image
-                and soft-pRF-weighted contrast to the same target.
+            contrast_constraint_full_image (`str`, *optional*, defaults to `"every_step"`):
+                When to constrain whole-image RMS contrast. `"every_step"`
+                projects before every brain-guidance evaluation and again
+                after the last diffusion step, `"final"` projects only
+                after the last step, and `"none"` disables it.
+            contrast_constraint_prf (`str`, *optional*, defaults to `"none"`):
+                When to additionally match soft-pRF-weighted RMS contrast
+                to the same target, using the same stage vocabulary. It
+                cannot run at a stage where `contrast_constraint_full_image`
+                does not, because the dual-scope solver drives both
+                statistics jointly, and it requires the `"match"` method.
+            luminance_constraint_full_image / luminance_constraint_prf (`str`):
+                Mean Rec.709 luma stages: "none", "every_step", or "final".
+                With luma_rgb_clip, contrast/luminance timings must match per scope.
+                pRF mean matching requires full-image mean matching at the
+                same or earlier stage. Luminance and contrast schedules can
+                differ. Active means and RMS targets are fitted jointly.
+            target_luminance_full_image / target_luminance_prf (`float`):
+                Explicit mean-luma targets in [0,1] units (the CLI uses 0-255).
+                Required for enabled luminance scopes. Combining luminance
+                with enabled contrast requires the "match" method.
+            luminance_validation_tolerance (`float`):
+                Absolute float mean-luma tolerance; defaults to 0.01/255.
+            luminance_shift_limit (`float`):
+                Local/global brightness offsets are bounded by +/- this
+                value in normalized image units; defaults to 1.0.
             negative_prompt (`str` or `List[str]`, *optional*):
                 The prompt or prompts not to guide the image generation. If not defined, one has to pass
                 `negative_prompt_embeds`. instead. If not defined, one has to pass `negative_prompt_embeds`. instead.
@@ -940,15 +1049,21 @@ class mypipelineSAG(DiffusionPipeline):
                 contrast_constraint_method = "max"
             else:
                 contrast_constraint_method = "none"
+        # "none" as a method and "none" as a whole-image stage are the same
+        # off switch; keep them consistent so only one has to be checked.
+        if contrast_constraint_method == "none":
+            contrast_constraint_full_image = "none"
+        if contrast_constraint_full_image == "none":
+            contrast_constraint_method = "none"
         _validate_contrast_constraint(
             contrast_constraint_method,
             min_contrast=min_rms_contrast,
             max_contrast=max_rms_contrast,
             target_contrast=target_rms_contrast,
         )
-        _validate_contrast_constraint_timing(contrast_constraint_timing)
-        _validate_contrast_constraint_scope(
-            contrast_constraint_scope,
+        _validate_contrast_constraint_stages(
+            contrast_constraint_full_image,
+            contrast_constraint_prf,
             contrast_constraint_method,
             contrast_prf_weight,
         )
@@ -965,7 +1080,34 @@ class mypipelineSAG(DiffusionPipeline):
                 "dual_scope_parameter_limit and dual_scope_envelope_power "
                 "must be positive."
             )
+        validate_luminance_settings(
+            luminance_constraint_full_image, luminance_constraint_prf,
+            target_luminance_full_image, target_luminance_prf,
+            luminance_validation_tolerance, contrast_constraint_full_image,
+            contrast_constraint_method, luminance_shift_limit,
+        )
+        if luminance_constraint_prf != "none" and contrast_prf_weight is None:
+            raise ValueError("Luminance pRF matching requires contrast_prf_weight")
+        validate_luma_contrast_method(
+            luma_contrast_method, contrast_constraint_full_image, contrast_constraint_prf,
+            luminance_constraint_full_image, luminance_constraint_prf,
+            contrast_constraint_method, luma_rgb_clip_match_iterations,
+        )
+        self.last_guidance_constraint_diagnostics = {}
+        luminance_options = dict(
+            luma_contrast_method=luma_contrast_method,
+            luma_rgb_clip_match_iterations=luma_rgb_clip_match_iterations,
+            guidance_constraint_diagnostics=self.last_guidance_constraint_diagnostics,
+            luminance_constraint_full_image=luminance_constraint_full_image,
+            luminance_constraint_prf=luminance_constraint_prf,
+            target_luminance_full_image=target_luminance_full_image,
+            target_luminance_prf=target_luminance_prf,
+            luminance_validation_tolerance=luminance_validation_tolerance,
+            luminance_shift_limit=luminance_shift_limit,
+        )
+        self.last_joint_diagnostics = None
         self.last_contrast_diagnostics = None
+        self.last_unconstrained_image = None
         self.grad_diff = 0.0
 
         # 2. Define call parameters
@@ -1097,8 +1239,8 @@ class mypipelineSAG(DiffusionPipeline):
                     noise_pred,
                     clip_guidance_scale,
                     contrast_constraint_method,
-                    contrast_constraint_timing,
-                    contrast_constraint_scope,
+                    contrast_constraint_full_image,
+                    contrast_constraint_prf,
                     contrast_prf_weight,
                     min_rms_contrast,
                     max_rms_contrast,
@@ -1107,6 +1249,7 @@ class mypipelineSAG(DiffusionPipeline):
                     dual_scope_every_step_iterations,
                     dual_scope_parameter_limit,
                     dual_scope_envelope_power,
+                    luminance_options,
                 )
             # compute the previous noisy sample x_t -> x_t-1
             latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
@@ -1127,8 +1270,45 @@ class mypipelineSAG(DiffusionPipeline):
         image = self.decode_latents(latents)
         image_tensor = torch.from_numpy(image).permute(0, 3, 1, 2)
         require_finite_seed_image(image_tensor, stage="final decode")
-        if contrast_constraint_method != "none":
-            if contrast_constraint_scope == "full_image_and_prf":
+        if (contrast_constraint_full_image != "none"
+                or luminance_constraint_full_image != "none"):
+            # Capture before any optional last projection, including every_step
+            # runs and callers that skip the last projection entirely.
+            # Its trajectory may already have used constrained guidance.
+            self.last_unconstrained_image = image.copy()
+        if apply_final_adjustment and (contrast_constraint_full_image != "none"
+                or luminance_constraint_full_image != "none"):
+            if luminance_constraint_full_image != "none":
+                targets = active_joint_targets(
+                    "final", contrast_constraint_full_image, contrast_constraint_prf,
+                    luminance_constraint_full_image, luminance_constraint_prf,
+                    target_rms_contrast, target_luminance_full_image, target_luminance_prf,
+                )
+                if luma_contrast_method == "luma_rgb_clip":
+                    image_tensor, self.last_joint_diagnostics = match_luma_rgb_clip(
+                        image_tensor, contrast_prf_weight, **targets,
+                        match_iterations=luma_rgb_clip_match_iterations,
+                        max_nfev=dual_scope_solver_max_nfev,
+                        mean_tolerance=luminance_validation_tolerance,
+                        rms_tolerance=dual_scope_tolerance,
+                        log_scale_limit=dual_scope_parameter_limit,
+                        shift_limit=luminance_shift_limit,
+                        adjustment_envelope_power=dual_scope_envelope_power,
+                    )
+                else:
+                    joint = match_luma_and_rms(
+                        image_tensor, contrast_prf_weight, **targets,
+                        max_nfev=dual_scope_solver_max_nfev,
+                        mean_tolerance=luminance_validation_tolerance,
+                        rms_tolerance=dual_scope_tolerance,
+                        log_scale_limit=dual_scope_parameter_limit,
+                        shift_limit=luminance_shift_limit,
+                        adjustment_envelope_power=dual_scope_envelope_power,
+                    )
+                    self.last_joint_diagnostics = joint_result_to_jsonable(joint)
+                    image_tensor = joint.images
+                self.last_contrast_diagnostics = self.last_joint_diagnostics
+            elif contrast_constraint_prf != "none":
                 contrast_result = match_global_and_prf_rms_contrast_final(
                     image_tensor,
                     contrast_prf_weight,
