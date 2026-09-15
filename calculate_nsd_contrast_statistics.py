@@ -18,36 +18,43 @@ import h5py
 import numpy as np
 
 
-DEFAULT_STIMULUS_FILE = Path(
-    "/lab_data/hendersonlab/datasets/nsd_preproc/stimuli/"
-    "S1_stimuli_224.h5py"
-)
-DEFAULT_SPLIT_FILE = Path(
-    "/user_data/junruz/prf_models/fixed/split_1_zscore/"
-    "S1/data_splits_S1.pkl"
-)
-DEFAULT_OUTPUT_JSON = Path(
-    "/user_data/junruz/prf_models/fixed/split_1_zscore/S1/nsd_contrast_statistics.json"
-)
-# DEFAULT_OUTPUT_PER_IMAGE = Path(
-#     "/user_data/junruz/prf_models/fixed/split_1_zscore/"
-#     "S1/nsd_contrast_statistics_per_image.npz"
-# )
+DEFAULT_STIMULUS_DIR = Path("/lab_data/hendersonlab/datasets/nsd_preproc/stimuli")
+DEFAULT_SPLIT_ROOT = Path("/user_data/junruz/prf_models/concat/split_1_zscore")
 REC709_WEIGHTS = np.asarray((0.2126, 0.7152, 0.0722), dtype=np.float32)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compute per-image Rec.709 luminance RMS contrast and summarize "
-            "its distribution."
+            "Compute per-image Rec.709 mean luminance and RMS contrast for "
+            "one NSD subject and summarize their distributions. Explicit file "
+            "paths override subject-derived defaults; they are not checked "
+            "for subject identity."
         )
+    )
+    parser.add_argument(
+        "--subject",
+        type=int,
+        choices=range(1, 9),
+        default=1,
+        help="NSD subject number, used to select default paths (default: 1).",
+    )
+    parser.add_argument(
+        "--stimulus-dir",
+        type=Path,
+        default=DEFAULT_STIMULUS_DIR,
+        help="Directory containing S{subject}_stimuli_224.h5py files.",
+    )
+    parser.add_argument(
+        "--split-root",
+        type=Path,
+        default=DEFAULT_SPLIT_ROOT,
+        help="Directory containing S{subject} split folders and default JSON outputs.",
     )
     parser.add_argument(
         "--stimulus-file",
         type=Path,
-        default=DEFAULT_STIMULUS_FILE,
-        help="HDF5 file containing the natural-image pixel array.",
+        help="Override <stimulus-dir>/S{subject}_stimuli_224.h5py.",
     )
     parser.add_argument(
         "--dataset-key",
@@ -57,9 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--split-file",
         type=Path,
-        default=DEFAULT_SPLIT_FILE,
         help=(
-            "Pickle containing BrainDiVE train/val/nest splits. Use "
+            "Override <split-root>/S{subject}/data_splits_S{subject}.pkl. Use "
             "--no-split to process every image."
         ),
     )
@@ -113,8 +119,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-json",
         type=Path,
-        default=DEFAULT_OUTPUT_JSON,
-        help="Optional path for the summary as JSON.",
+        help="Override <split-root>/S{subject}/nsd_contrast_statistics.json.",
     )
     parser.add_argument(
         "--output-per-image",
@@ -125,7 +130,15 @@ def parse_args() -> argparse.Namespace:
             "and rms_contrast in [0,1] units."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    subject_dir = args.split_root / f"S{args.subject}"
+    if args.stimulus_file is None:
+        args.stimulus_file = args.stimulus_dir / f"S{args.subject}_stimuli_224.h5py"
+    if args.split_file is None:
+        args.split_file = subject_dir / f"data_splits_S{args.subject}.pkl"
+    if args.output_json is None:
+        args.output_json = subject_dir / "nsd_contrast_statistics.json"
+    return args
 
 
 def load_split_indices(
@@ -291,6 +304,7 @@ def calculate(args: argparse.Namespace) -> tuple[dict[str, Any], np.ndarray, np.
     mean_unit = distribution_summary(luminance_means, percentiles)
     rms_unit = distribution_summary(rms_contrasts, percentiles)
     summary = {
+        "subject": args.subject,
         "definition": (
             "Population standard deviation of Rec.709 luminance per image; "
             "not divided by mean luminance."
