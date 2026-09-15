@@ -244,8 +244,8 @@ def load_nsd_rois(ss, args):
     noise_ceiling = roi_info['noise_ceiling_avgreps'] / 100.
 
     big_mask = roi_info['voxel_mask']
-    roi_keys = ['roi_labels_retino', 'roi_labels_kastner', 'roi_labels_face', 'roi_labels_place', 'roi_labels_body']
-    roi_names = ['ret_prf_roi_names', 'kastner_atlas_roi_names', 'floc_face_roi_names', 'floc_place_roi_names', 'floc_body_roi_names']
+    roi_keys = ['roi_labels_kastner', 'roi_labels_retino', 'roi_labels_face', 'roi_labels_place', 'roi_labels_body']
+    roi_names = ['kastner_atlas_roi_names', 'ret_prf_roi_names', 'floc_face_roi_names', 'floc_place_roi_names', 'floc_body_roi_names']
     roi_masks = dict()
     for key, name in zip(roi_keys, roi_names):
         roi_labels = roi_info[key][big_mask]
@@ -1218,14 +1218,8 @@ def main():
     # random.seed(a=b64encode(os.urandom(5)).decode('utf-8'))
     # random.shuffle(regions)
 
-<<<<<<< HEAD
     generation_timing = {"seconds": 0.0, "calls": 0}
     prf_grid_params, prf_grid_name = get_prf_grid("default-log-polar")
-=======
-
-    generation_timing = {"seconds": 0.0, "calls": 0}
-
->>>>>>> d1ffe2c (configure path for bridges2 cluster)
     for region in regions:
         print("Starting S{} {}".format(ss, region))
         # random.seed(a=b64encode(os.urandom(5)).decode('utf-8'))
@@ -1665,7 +1659,6 @@ def main():
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
                     generation_start = time.perf_counter()
-<<<<<<< HEAD
                     try:
                         try:
                             image = pipe(
@@ -1728,37 +1721,6 @@ def main():
                             f"Rejected seed {seed}: {error.reason} ({error})"
                         )
                         continue
-=======
-                    image = pipe(
-                        "",
-                        sag_scale=0.75,
-                        guidance_scale=0.0,
-                        num_inference_steps=num_steps,
-                        generator=g,
-                        clip_guidance_scale=brain_guidance_scale,
-                        contrast_constraint_method=args.contrast_constraint_method,
-                        min_rms_contrast=(
-                            args.min_rms_contrast / 255.0
-                            if args.min_rms_contrast is not None
-                            else None
-                        ),
-                        max_rms_contrast=(
-                            args.max_rms_contrast / 255.0
-                            if args.max_rms_contrast is not None
-                            else None
-                        ),
-                        target_rms_contrast=(
-                            args.target_rms_contrast / 255.0
-                            if args.target_rms_contrast is not None
-                            else None
-                        ),
-                        output_type="np",
-                    )
-                    if device.type == "cuda":
-                        torch.cuda.synchronize(device)
-                    generation_timing["seconds"] += time.perf_counter() - generation_start
-                    generation_timing["calls"] += 1
->>>>>>> d1ffe2c (configure path for bridges2 cluster)
                     image_array = np.asarray(image.images[0], dtype=np.float32)
                     reason, contrast_metrics = candidate_rejection_reason(
                         image_array
@@ -1856,7 +1818,6 @@ def main():
                     f"but metadata expects {rank_metadata['num_features']}"
                 )
 
-<<<<<<< HEAD
             ranking_model_folder = os.path.join(
                 voxel_folder, "ranking_model"
             )
@@ -1898,8 +1859,6 @@ def main():
                 f"{ranking_model_metadata_path}"
             )
 
-=======
->>>>>>> d1ffe2c (configure path for bridges2 cluster)
             while (
                 len(image_records) < args.num_seeds
                 and len(pending_records) > 0
@@ -2005,11 +1964,7 @@ def main():
             with open(ranking_file, "w") as f:
                 json.dump(
                     {
-<<<<<<< HEAD
                         "schema_version": 6,
-=======
-                        "schema_version": 4,
->>>>>>> d1ffe2c (configure path for bridges2 cluster)
                         "region": region,
                         "subject": int(ss),
                         "voxel_id": int(voxel_id),
@@ -2017,7 +1972,6 @@ def main():
                         "voxel_rank": int(voxel_rank),
                         "voxel_rank_in_topk": int(voxel_rank),
                         "voxel_r2": float(topk_values[i]),
-<<<<<<< HEAD
                         "prf_idx": int(prf_idx),
                         "prf_grid_name": prf_grid_name,
                         "prf_x": float(prf_grid_params[int(prf_idx), 0]),
@@ -2025,8 +1979,6 @@ def main():
                         "prf_sigma": float(prf_grid_params[int(prf_idx), 2]),
                         "contrast_prf_layer": contrast_prf_layer,
                         "contrast_prf_native_size": contrast_prf_native_size,
-=======
->>>>>>> d1ffe2c (configure path for bridges2 cluster)
                         "generation_status": (
                             "complete"
                             if len(image_records) >= args.num_seeds
@@ -2127,10 +2079,6 @@ def main():
             json.dump(timing_payload, timing_handle, indent=2)
         print(f"Generation-only timing: {timing_payload}")
 
-<<<<<<< HEAD
-
-=======
->>>>>>> d1ffe2c (configure path for bridges2 cluster)
 
 if __name__ == "__main__":
     main()
