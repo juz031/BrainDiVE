@@ -29,7 +29,7 @@ from postprocess_ranked_utils import (
 
 PROJECT = Path('/ocean/projects/soc250009p/jzhao7')
 MODES = ('unadjusted', 'full_only', 'full_and_prf')
-SCHEMA = 3
+SCHEMA = 4
 
 
 def parse_args(argv=None):
@@ -54,6 +54,9 @@ def parse_args(argv=None):
     parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
     parser.add_argument('--threads', type=int, default=4)
+    parser.add_argument('--adjustment-device', choices=['auto', 'cpu', 'cuda'], default='auto',
+                        help='auto uses the scoring device; cuda batches both adjustment modes on GPU')
+    parser.add_argument('--gpu-solver-max-iterations', type=int, default=100)
     parser.add_argument('--adv-checkpoint', type=Path, default=PROJECT / 'data/model/imagenet_l2_3_0.pt')
     parser.add_argument('--dino-checkpoint', type=Path,
                         default=Path(torch.hub.get_dir()) / 'checkpoints/dino_resnet50_pretrain.pth')
@@ -61,7 +64,7 @@ def parse_args(argv=None):
     parser.add_argument('--resume', action='store_true', help='Verify and skip matching completed mode outputs')
     parser.add_argument('--dry-run', action='store_true', help='Read metadata/checkpoints only; no encoder or output writes')
     args = parser.parse_args(argv)
-    for field in ('top_n', 'sample_images', 'sample_voxels', 'batch_size', 'threads'):
+    for field in ('top_n', 'sample_images', 'sample_voxels', 'batch_size', 'threads', 'gpu_solver_max_iterations'):
         if getattr(args, field) <= 0:
             parser.error(f'--{field.replace("_", "-")} must be positive')
     if args.voxel_rank_range and not 1 <= args.voxel_rank_range[0] <= args.voxel_rank_range[1]:
@@ -199,6 +202,9 @@ def prepare_group(args, group, backbones, code_hashes):
                   backbones={n: file_identity(backbones[n]) for n in (model, 'OPEN_CLIP_RN50')},
                   implementation=code_hashes, settings=settings_from_generation(d), top_n=args.top_n,
                   sample=args.sample, tie_break='seed_ascending',
+                  adjustment_device=args.adjustment_device,
+                  adjustment_backend='torch_cuda_batched_luma_lm_v1' if args.adjustment_device == 'cuda' else 'reference_cpu',
+                  gpu_solver_max_iterations=args.gpu_solver_max_iterations if args.adjustment_device == 'cuda' else None,
                   subject=d['subject'], region=d['region'], voxel_id=d['voxel_id'],
                   generation_model=model, ranking_model='OPEN_CLIP_RN50', prf_id=d['prf_idx'])
     return dict(config=config, gen_folder=gen_folder, gen_meta=gen_meta,
@@ -288,33 +294,57 @@ def process_mode(stage, group, mode, config, weight, scorer, batch_size):
             handle.write(json.dumps(dict(**source, diagnostics=diagnostics), allow_nan=False) + '\n')
         pending.clear()
 
+    def record_failure(source, error):
+        failure = dict(**source, reason=error.reason, message=str(error))
+        if error.result is not None:
+            failure['solver'] = joint_result_to_jsonable(error.result)
+        if hasattr(error, 'diagnostics'):
+            failure['diagnostics'] = error.diagnostics
+        failures.append(failure)
+
     with open(diagnostics_path, 'w') as handle:
-        for index, source in enumerate(group['images'], 1):
-            try:
-                pixels = read_pixels(source['source_path'])
-            except (OSError, UnidentifiedImageError, ValueError) as error:
-                failures.append(dict(**source, reason='invalid_source_image', message=str(error)))
-                continue
-            try:
-                if mode == 'unadjusted':
-                    prepared_pixels, diagnostics = prepare_unadjusted_pixels(pixels, weight)
-                else:
-                    prepared_pixels, diagnostics = adjust_pixels(pixels, mode, weight, config['settings'])
-            except DualScopeContrastConvergenceError as error:
-                failure = dict(**source, reason=error.reason, message=str(error))
-                if error.result is not None:
-                    failure['solver'] = joint_result_to_jsonable(error.result)
-                if isinstance(error, FinalPNGValidationError):
-                    failure['diagnostics'] = error.diagnostics
-                failures.append(failure)
-                continue
-            # Scoring receives only completed branch pixels. Export later uses
-            # those same arrays; no adjustment is performed after scoring.
-            pending.append((source, prepared_pixels, diagnostics))
-            if len(pending) >= batch_size:
-                flush(handle)
-            if index % 25 == 0:
-                print(f'  {mode}: prepared {index}/{len(group["images"])}', flush=True)
+        for start in range(0, len(group['images']), batch_size):
+            loaded = []
+            for source in group['images'][start:start + batch_size]:
+                try:
+                    loaded.append((source, read_pixels(source['source_path'])))
+                except (OSError, UnidentifiedImageError, ValueError) as error:
+                    failures.append(dict(**source, reason='invalid_source_image', message=str(error)))
+            if mode != 'unadjusted' and config.get('adjustment_device') == 'cuda':
+                from postprocess_gpu_adjustment import adjust_pixels_cuda
+                # Different image sizes can be decoded, so batch only like shapes.
+                outcomes = [None] * len(loaded)
+                shapes = {}
+                for i, (_, pixels) in enumerate(loaded):
+                    shapes.setdefault(pixels.shape, []).append(i)
+                for ids in shapes.values():
+                    results = adjust_pixels_cuda([loaded[i][1] for i in ids], mode, weight,
+                                                 config['settings'],
+                                                 max_iterations=config['gpu_solver_max_iterations'])
+                    if len(results) != len(ids):
+                        raise RuntimeError('GPU preparation returned the wrong batch size')
+                    for i, result in zip(ids, results):
+                        outcomes[i] = result
+            else:
+                outcomes = []
+                for source, pixels in loaded:
+                    try:
+                        outcomes.append(prepare_unadjusted_pixels(pixels, weight) if mode == 'unadjusted'
+                                        else adjust_pixels(pixels, mode, weight, config['settings']))
+                    except DualScopeContrastConvergenceError as error:
+                        outcomes.append(error)
+            for (source, _), outcome in zip(loaded, outcomes):
+                if isinstance(outcome, DualScopeContrastConvergenceError):
+                    record_failure(source, outcome)
+                    continue
+                prepared_pixels, diagnostics = outcome
+                # Only accepted final uint8 pixels reach either scorer.
+                pending.append((source, prepared_pixels, diagnostics))
+                if len(pending) >= batch_size:
+                    flush(handle)
+            done = min(start + batch_size, len(group['images']))
+            if done == len(group['images']) or done // 100 > start // 100:
+                print(f'  {mode}: prepared {done}/{len(group["images"])}', flush=True)
         flush(handle)
 
     selections = {}
@@ -360,15 +390,20 @@ def run(args):
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if device == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA requested but unavailable')
+    if args.adjustment_device == 'auto':
+        args.adjustment_device = device
+    if args.adjustment_device == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('CUDA adjustment requested but unavailable')
     backbones = backbone_paths(args)
     source_dir = Path(__file__).resolve().parent
     code_hashes = {name: sha256_file(source_dir / name) for name in (
         'postprocess_ranked_images.py', 'postprocess_ranked_utils.py', 'luma_rgb_clip_utils.py',
         'joint_luma_contrast_utils.py', 'dual_scope_contrast_utils.py', 'prf_utils.py',
-        'ranking_model_training_utils.py')}
+        'ranking_model_training_utils.py', 'postprocess_gpu_adjustment.py')}
     groups = discover(args)
     print(f'{"SAMPLE" if args.sample else "FULL"}: {len(groups)} voxel/model groups, '
-          f'{sum(len(g["images"]) for g in groups)} source PNGs, modes={args.modes}, device={device}', flush=True)
+          f'{sum(len(g["images"]) for g in groups)} source PNGs, modes={args.modes}, device={device}, '
+          f'adjustment_device={args.adjustment_device}', flush=True)
     encoders, cached_generation, cached_key = {}, None, None
     total_valid = total_skipped = 0
     for group in groups:
@@ -417,7 +452,9 @@ def run(args):
                     stage.mkdir()
                     summary = process_mode(stage, group, mode, config, weight, scorer, args.batch_size)
                     summary['runtime'] = dict(device=device, torch_version=torch.__version__, threads=args.threads,
-                                              slurm_job_id=os.environ.get('SLURM_JOB_ID'))
+                                              slurm_job_id=os.environ.get('SLURM_JOB_ID'),
+                                              adjustment_device=args.adjustment_device,
+                                              adjustment_backend=config['adjustment_backend'])
                     json_dump(stage / 'summary.json', summary)
                     os.rename(stage, folder)
                 total_valid += summary['valid_count']
