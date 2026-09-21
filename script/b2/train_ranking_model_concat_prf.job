@@ -1,0 +1,130 @@
+#!/bin/bash
+#SBATCH --job-name=s2V3_train_rank
+#SBATCH --account=soc250009p
+#SBATCH --partition=GPU-shared
+#SBATCH --gres=gpu:v100-32:1
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=5
+#SBATCH --mem=32G
+#SBATCH --time=10:00:00
+#SBATCH --array=0-1%2
+#SBATCH --output=/ocean/projects/soc250009p/jzhao7/code/BrainDiVE/script/b2/slurm_out/%x-%A_%a.out
+#SBATCH --error=/ocean/projects/soc250009p/jzhao7/code/BrainDiVE/script/b2/slurm_out/%x-%A_%a.err
+
+# Standalone ranking training only; no diffusion or image generation.
+# sbatch script/b2/train_ranking_model_concat_prf.job 2
+# sbatch --export=ALL,SPLIT_ID=2,ROI='V1 hV4',SKIP_EXISTING=true script/b2/train_ranking_model_concat_prf.job 5
+# GPU selection belongs in #SBATCH --gres (or an sbatch --gres override).
+# For V100, also set CONDA_ENV=env2025_v100 (env2025 lacks sm_70 support).
+# Positional subject overrides SUBJECT_ID; default subject is 2.
+# Extra arguments after the subject are forwarded to Python.
+# Read-only login-node check: bash <this-script> 2 --dry_run
+
+set -euo pipefail
+PROJECT_ROOT=/ocean/projects/soc250009p/jzhao7
+CODE_ROOT=${CODE_ROOT:-${PROJECT_ROOT}/code/BrainDiVE}
+CONDA_ROOT=${CONDA_ROOT:-${PROJECT_ROOT}/software/miniforge3}
+CONDA_ENV=${CONDA_ENV:-env2025_v100}
+NSD_ROOT=${NSD_ROOT:-/ocean/projects/soc250009p/shared/datasets/nsd_preproc}
+MODEL_ROOT=${MODEL_ROOT:-${PROJECT_ROOT}/data/model/concat/split_1_zscore}
+FEATURE_ROOT=${FEATURE_ROOT:-${PROJECT_ROOT}/data/prf_features}
+SAVE_ROOT=${SAVE_ROOT:-${PROJECT_ROOT}/data/model/ranking}
+GEN_MODELS=(DINO_RN50 ADV_RN50)
+RANK_MODELS=(OPEN_CLIP_RN50 OPEN_CLIP_RN50)
+TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
+if [[ ! ${TASK_ID} =~ ^[01]$ ]]; then
+    echo 'SLURM_ARRAY_TASK_ID must be 0 or 1' >&2
+    exit 2
+fi
+GEN_MODEL=${GEN_MODEL:-${GEN_MODELS[$TASK_ID]}}
+RANK_MODEL=${RANK_MODEL:-${RANK_MODELS[$TASK_ID]}}
+# Use --array=0 when overriding a model pair, to avoid duplicate tasks.
+SUBJECT_ID=${SUBJECT_ID:-2}
+if (( $# > 0 )); then
+    SUBJECT_ID=$1
+    shift
+fi
+if [[ ! ${SUBJECT_ID} =~ ^[1-8]$ ]]; then
+    echo 'First argument / SUBJECT_ID must be an integer from 1 through 8' >&2
+    exit 2
+fi
+SPLIT_ID=${SPLIT_ID:-1}
+ROI=${ROI:-V3}
+K=${K:-20}
+VOXEL_RANK_START=${VOXEL_RANK_START:-}
+VOXEL_RANK_END=${VOXEL_RANK_END:-}
+ROI_PATH=${ROI_PATH:-${NSD_ROOT}/rois/S${SUBJECT_ID}_voxel_roi_info.npy}
+R2_NOISE_CEILING_THRESHOLD=${R2_NOISE_CEILING_THRESHOLD:-0}
+DEVICE=${DEVICE:-cuda}
+SKIP_EXISTING=${SKIP_EXISTING:-false}
+OVERWRITE=${OVERWRITE:-false}
+DRY_RUN=${DRY_RUN:-false}
+for flag in SKIP_EXISTING OVERWRITE DRY_RUN; do
+    if [[ ${!flag} != true && ${!flag} != false ]]; then
+        echo "${flag} must be true or false" >&2
+        exit 2
+    fi
+done
+if [[ ${SKIP_EXISTING} == true && ${OVERWRITE} == true ]]; then
+    echo 'SKIP_EXISTING and OVERWRITE are mutually exclusive' >&2
+    exit 2
+fi
+if [[ ${SPLIT_ID} != 1 && ${SPLIT_ID} != 2 ]]; then
+    echo 'SPLIT_ID must be 1 or 2' >&2
+    exit 2
+fi
+read -r -a ROIS <<< "${ROI}"
+if (( ${#ROIS[@]} == 0 )); then
+    echo 'ROI must contain at least one ROI name' >&2
+    exit 2
+fi
+ARGS=(--subject_id "${SUBJECT_ID}" --gen_model "${GEN_MODEL}"
+      --rank_model "${RANK_MODEL}" --split_id "${SPLIT_ID}"
+      --roi "${ROIS[@]}" --k "${K}" --device "${DEVICE}"
+      --nsd_root "${NSD_ROOT}" --model_root "${MODEL_ROOT}"
+      --feature_root "${FEATURE_ROOT}" --save_root "${SAVE_ROOT}"
+      --roi_path "${ROI_PATH}"
+      --r2_noise_ceiling_threshold "${R2_NOISE_CEILING_THRESHOLD}")
+if [[ -n ${VOXEL_RANK_START} || -n ${VOXEL_RANK_END} ]]; then
+    if [[ ! ${VOXEL_RANK_START} =~ ^[1-9][0-9]*$ ||
+          ! ${VOXEL_RANK_END} =~ ^[1-9][0-9]*$ ]] ||
+       (( VOXEL_RANK_END < VOXEL_RANK_START )); then
+        echo 'Provide both rank endpoints with 1 <= START <= END' >&2
+        exit 2
+    fi
+    ARGS+=(--voxel_rank_range "${VOXEL_RANK_START}" "${VOXEL_RANK_END}")
+fi
+[[ ${SKIP_EXISTING} == true ]] && ARGS+=(--skip_existing)
+[[ ${OVERWRITE} == true ]] && ARGS+=(--overwrite)
+[[ ${DRY_RUN} == true ]] && ARGS+=(--dry_run)
+ARGS+=("$@")
+IS_DRY_RUN=false
+for arg in "${ARGS[@]}"; do
+    [[ ${arg} == --dry_run ]] && IS_DRY_RUN=true
+done
+if [[ -z ${SLURM_JOB_ID:-} && ${IS_DRY_RUN} != true ]]; then
+    echo 'Submit with sbatch, or use --dry_run outside a Slurm allocation' >&2
+    exit 2
+fi
+set +u
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate "${CONDA_ENV}"
+set -u
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
+export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
+export PYTHONUNBUFFERED=1
+export PYTHONDONTWRITEBYTECODE=1
+cd "${CODE_ROOT}"
+printf 'subject=%s split=%s gen=%s rank=%s env=%s\n' \
+    "${SUBJECT_ID}" "${SPLIT_ID}" "${GEN_MODEL}" "${RANK_MODEL}" "${CONDA_ENV}"
+printf 'Command: python -u train_ranking_model_concat_prf.py'
+printf ' %q' "${ARGS[@]}"
+printf '\n'
+if [[ ${IS_DRY_RUN} == true ]]; then
+    python -u train_ranking_model_concat_prf.py "${ARGS[@]}"
+else
+    srun python -u train_ranking_model_concat_prf.py "${ARGS[@]}"
+fi

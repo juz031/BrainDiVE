@@ -1,0 +1,38 @@
+#!/bin/bash
+#SBATCH --job-name=prf_postprocess
+#SBATCH --account=soc250009p
+#SBATCH --partition=GPU-shared
+#SBATCH --gres=gpu:v100-32:1
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=24G
+#SBATCH --time=04:00:00
+#SBATCH --output=/ocean/projects/soc250009p/jzhao7/code/BrainDiVE/script/b2/slurm_out/%x-%j.out
+#SBATCH --error=/ocean/projects/soc250009p/jzhao7/code/BrainDiVE/script/b2/slurm_out/%x-%j.err
+
+# Defaults to the bounded sample. Nothing in this script submits another job.
+# Extra Python arguments may narrow subjects, ROIs, models, and voxel ranks.
+set -euo pipefail
+PROJECT_ROOT=/ocean/projects/soc250009p/jzhao7
+CONDA_ENV=${CONDA_ENV:-env2025_v100}
+RUN_SCOPE=${RUN_SCOPE:-sample}
+case "${RUN_SCOPE}" in
+    sample) SCOPE_ARG=--sample ;;
+    full)
+        if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+            echo 'Full processing requires an existing Slurm allocation.' >&2
+            exit 2
+        fi
+        SCOPE_ARG=--full-run ;;
+    *) echo 'RUN_SCOPE must be sample or full' >&2; exit 2 ;;
+esac
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-4}
+export MKL_NUM_THREADS=${OMP_NUM_THREADS}
+export OPENBLAS_NUM_THREADS=${OMP_NUM_THREADS}
+export HF_HUB_OFFLINE=1
+export HF_HUB_DISABLE_TELEMETRY=1
+export PYTHONUNBUFFERED=1
+cd "${PROJECT_ROOT}/code/BrainDiVE"
+exec "${PROJECT_ROOT}/software/miniforge3/envs/${CONDA_ENV}/bin/python" -B \
+    postprocess_ranked_images.py "${SCOPE_ARG}" --threads "${OMP_NUM_THREADS}" "$@"
